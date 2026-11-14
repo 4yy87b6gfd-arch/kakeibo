@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ふたりの家計簿</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ===== パスワードゲート ===== -->
+<div id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <div class="gate-logo">🏠</div>
+    <h1 class="gate-title">ふたりの家計簿</h1>
+    <!-- 初回：パスワード設定 -->
+    <div id="gate-setup" hidden>
+      <p class="gate-text">家族パスワードを設定してください。<br>ふたりで同じパスワードを使います。</p>
+      <input type="password" id="setup-pass1" class="gate-input" placeholder="パスワード" autocomplete="new-password">
+      <input type="password" id="setup-pass2" class="gate-input" placeholder="パスワード（確認）" autocomplete="new-password">
+      <p class="gate-error" id="setup-error"></p>
+      <button class="btn primary block" id="setup-btn">設定してはじめる</button>
+    </div>
+    <!-- 通常：ログイン -->
+    <div id="gate-login" hidden>
+      <p class="gate-text">家族パスワードを入力してください。</p>
+      <input type="password" id="login-pass" class="gate-input" placeholder="パスワード" autocomplete="current-password">
+      <p class="gate-error" id="login-error"></p>
+      <button class="btn primary block" id="login-btn">開く</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== アプリ本体 ===== -->
+<div id="app" hidden>
+  <header class="app-header">
+    <div class="header-title">ふたりの家計簿</div>
+    <!-- 同期状態表示：Firestoreアダプタ導入時にこの要素の文言を差し替える（app.js: renderSyncStatus） -->
+    <div class="sync-status" id="sync-status">ローカル保存</div>
+  </header>
+
+  <main class="main">
+    <!-- 今月 -->
+    <section id="tab-home" class="tab-page"></section>
+    <!-- 履歴 -->
+    <section id="tab-history" class="tab-page" hidden></section>
+    <!-- 入力 -->
+    <section id="tab-entry" class="tab-page" hidden></section>
+    <!-- 比較 -->
+    <section id="tab-compare" class="tab-page" hidden></section>
+    <!-- 設定 -->
+    <section id="tab-settings" class="tab-page" hidden></section>
+  </main>
+
+  <nav class="tabbar">
+    <button class="tab-btn active" data-tab="home"><span class="tab-icon">📅</span><span>今月</span></button>
+    <button class="tab-btn" data-tab="history"><span class="tab-icon">📖</span><span>履歴</span></button>
+    <button class="tab-btn entry-btn" data-tab="entry"><span class="tab-icon entry-icon">＋</span><span>入力</span></button>
+    <button class="tab-btn" data-tab="compare"><span class="tab-icon">📊</span><span>比較</span></button>
+    <button class="tab-btn" data-tab="settings"><span class="tab-icon">⚙️</span><span>設定</span></button>
+  </nav>
+</div>
+
+<!-- ===== モーダル（記録の編集 / 固定費コピー など汎用） ===== -->
+<div id="modal-backdrop" class="modal-backdrop" hidden>
+  <div class="modal" id="modal-box"></div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<input type="file" id="import-file" accept=".json,application/json" hidden>
+
+<script src="app.js"></script>
+</body>
+</html>
