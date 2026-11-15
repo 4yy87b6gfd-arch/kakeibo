@@ -144,6 +144,13 @@ assert.strictEqual(run('goalProgress({ target: 100, saved: 125 })'), 100, "進�
 assert.strictEqual(run('goalProgress({ target: 0, saved: 0 })'), 0, "目標0・貯金0は0%");
 assert.strictEqual(run('goalProgress({ target: 0, saved: 10 })'), 100, "目標0で貯金があれば100%");
 assert.strictEqual(run('normalizeData({ settings: { members: [], categories: [], keywords: {} }, months: [] }).goals.length'), 0, "goals が無いデータでは空配列になること");
+assert.strictEqual(gnorm.goals[0].kind, "save", "種別が無い目標は貯金目標として正規化されること");
+const gnorm2 = run('normalizeData({ settings: { members: [], categories: [], keywords: {} }, months: [], goals: [{ id: "d1", name: "住宅ローン", kind: "debt", target: 4000000, saved: 100000 }, { id: "d2", name: "x", kind: "xxx", target: 1, saved: 0 }] })');
+assert.strictEqual(gnorm2.goals[0].kind, "debt", "借金の種別が保持されること");
+assert.strictEqual(gnorm2.goals[1].kind, "save", "不正な種別は貯金目標に正規化されること");
+run("state.data = " + JSON.stringify(gnorm2));
+assert.strictEqual(run('goalsOfKind("debt").length'), 1, "借金だけを絞り込めること");
+assert.strictEqual(run('debtRemaining()'), 3900000, "借金の残り合計が計算できること");
 console.log("貯金目標チェック OK");
 
 /* --- 不正データの検証 --- */

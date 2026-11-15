@@ -339,8 +339,9 @@ function toast(msg) {
  *     記録の保存・編集・削除に合わせて adjustAccountBalance で残高を増減させる。
  *   transfers: [{ id, date, fromId, toId, amount, note, createdAt }]  // 口座間の移動（振替）
  *     収支には数えず、2口座の残高を adjustTransferBalance で移すだけ。
- *   goals: [{ id, name, target, saved, createdAt }]  // 貯金目標
- *     saved は「この目的のために確保している金額」の目安で、口座残高そのものは変えない。
+ *   goals: [{ id, kind, name, target, saved, createdAt }]  // 貯金目標と借金
+ *     kind: "save"（貯金目標）/ "debt"（借金）。save は target=目標金額・saved=確保済み、
+ *     debt は target=借入総額・saved=返済済み。どちらも口座残高そのものは変えない。
  * } */
 function emptyData() {
   return {
@@ -771,13 +772,25 @@ function renderHome() {
       ${accs.slice(0, 4).map(a => `<div class="row between"><span>🏦 ${esc(a.name)}</span><span>${esc(yen(a.balance))}</span></div>`).join("")}
     </div>` : ""}
 
-    ${goals().length ? `<div class="card">
+    ${goalsOfKind("save").length ? `<div class="card">
       <div class="row between">
         <h3 style="margin:0">貯金目標</h3>
         <button class="btn small" data-act="goto-goals">目標タブで管理</button>
       </div>
-      ${goals().slice(0, 3).map(g => { const pct = goalProgress(g); return `<div style="margin-top:8px">
+      ${goalsOfKind("save").slice(0, 3).map(g => { const pct = goalProgress(g); return `<div style="margin-top:8px">
         <div class="row between"><span>🎯 ${esc(g.name)}</span><span class="small">${esc(yen(g.saved))} ／ ${esc(yen(g.target))}（${pct}%）</span></div>
+        <div class="bar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+      </div>`; }).join("")}
+    </div>` : ""}
+
+    ${goalsOfKind("debt").length ? `<div class="card">
+      <div class="row between">
+        <h3 style="margin:0">借金</h3>
+        <button class="btn small" data-act="goto-goals">目標タブで管理</button>
+      </div>
+      <div class="row between" style="margin-top:8px"><span class="muted">残りの借金</span><b class="amount-expense">${esc(yen(debtRemaining()))}</b></div>
+      ${goalsOfKind("debt").slice(0, 3).map(g => { const pct = goalProgress(g); return `<div style="margin-top:8px">
+        <div class="row between"><span>💳 ${esc(g.name)}</span><span class="small">残り ${esc(yen(Math.max(0, (Number(g.target) || 0) - (Number(g.saved) || 0))))}（返済 ${pct}%）</span></div>
         <div class="bar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
       </div>`; }).join("")}
     </div>` : ""}
@@ -1523,11 +1536,12 @@ function normalizeData(data) {
       amount: Number(t.amount) || 0, note: String(t.note || ""),
       createdAt: t.createdAt || null
     }));
-  /* 貯金目標：無いデータでは空配列にし、壊れた要素は落とす。金額は0以上の整数に丸める */
+  /* 貯金目標・借金：無いデータでは空配列にし、壊れた要素は落とす。金額は0以上の整数に丸める */
   d.goals = (Array.isArray(d.goals) ? d.goals : [])
     .filter(g => g && g.id && String(g.name || "").trim())
     .map(g => ({
       id: String(g.id), name: String(g.name),
+      kind: g.kind === "debt" ? "debt" : "save",
       target: Math.max(0, Math.round(Number(g.target) || 0)),
       saved: Math.max(0, Math.round(Number(g.saved) || 0)),
       createdAt: g.createdAt || null
@@ -1557,47 +1571,66 @@ function importFromFile(file) {
 }
 
 /* ---------------- 資産タブ（口座・残高の手動管理） ---------------- */
-/* ---------------- 貯金目標タブ ----------------
- * 目標ごとの「目標金額」と「いま確保している金額（saved）」を管理する。
- * saved は目安の取り分け表示で、口座残高そのものは変えない（実際に口座間で
- * お金を動かすときは入力タブの「振替」を使う）。 */
+/* ---------------- 貯金目標・借金タブ ----------------
+ * 目標（kind: "save"）と借金（kind: "debt"）を同じ仕組みで管理する。
+ *   save: target=目標金額、saved=いま確保している金額（口座残高の取り分け目安）
+ *   debt: target=借入総額、saved=返済済みの金額
+ * どちらも進捗率 = saved / target。ここでの金額操作は口座残高そのものを
+ * 変えない（実際の入出金は収支の記録や「振替」で別に記録する）。 */
+const GOAL_KIND_LABELS = {
+  save: { icon: "🎯", add: "貯める", sub: "取り崩す", done: "達成🎉",
+          totalLabel: "目標金額", savedLabel: "いま貯まっている金額", restWord: "あと",
+          nameLabel: "目標の名前", addToast: "貯金に加えました", subToast: "取り崩しました" },
+  debt: { icon: "💳", add: "返済する", sub: "返済を戻す", done: "完済🎉",
+          totalLabel: "借入総額", savedLabel: "返済済みの金額", restWord: "残り",
+          nameLabel: "借金の名前", addToast: "返済を記録しました", subToast: "返済を戻しました" }
+};
+function goalsOfKind(kind) { return goals().filter(g => (g.kind || "save") === kind); }
+/* 借金の残り合計（返済済みが総額を超えた分は0止め） */
+function debtRemaining() {
+  const debts = goalsOfKind("debt");
+  const total = debts.reduce((s, g) => s + (Number(g.target) || 0), 0);
+  const paid = debts.reduce((s, g) => s + (Number(g.saved) || 0), 0);
+  return Math.max(0, total - paid);
+}
+function goalRowHTML(g) {
+  const L = GOAL_KIND_LABELS[g.kind || "save"];
+  const pct = goalProgress(g);
+  const target = Number(g.target) || 0, saved = Number(g.saved) || 0;
+  const done = target > 0 && saved >= target;
+  return `<div class="account-row">
+    <div class="row between">
+      <span class="cat-name">${L.icon} ${esc(g.name)}${done ? ` <span class="badge closed">${L.done}</span>` : ""}</span>
+      <span class="cat-amount">${pct}%</span>
+    </div>
+    <div class="bar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
+    <div class="row between" style="margin-top:4px">
+      <span class="muted small">${esc(yen(saved))} ／ ${esc(yen(target))}（${L.restWord} ${esc(yen(Math.max(0, target - saved)))}）</span>
+      <span class="row">
+        <button class="btn small" data-goal-add="${esc(g.id)}">${L.add}</button>
+        <button class="btn small" data-goal-edit="${esc(g.id)}">編集</button>
+      </span>
+    </div>
+  </div>`;
+}
 function renderGoals() {
-  const list = goals();
-  const totalTarget = list.reduce((s, g) => s + (Number(g.target) || 0), 0);
-  const totalSaved = list.reduce((s, g) => s + (Number(g.saved) || 0), 0);
+  const saves = goalsOfKind("save"), debts = goalsOfKind("debt");
+  const sum = (list, k) => list.reduce((s, g) => s + (Number(g[k]) || 0), 0);
   $("#tab-goals").innerHTML = `
     <div class="card">
-      <h3>貯金目標</h3>
-      <div class="row between"><span class="muted">貯めた合計</span><span class="big-amount">${esc(yen(totalSaved))}</span></div>
-      <div class="row between" style="margin-top:2px"><span class="muted">目標の合計</span><span>${esc(yen(totalTarget))}</span></div>
+      <h3>🎯 貯金目標</h3>
+      <div class="row between"><span class="muted">貯めた合計</span><span class="big-amount">${esc(yen(sum(saves, "saved")))}</span></div>
+      <div class="row between" style="margin-top:2px"><span class="muted">目標の合計</span><span>${esc(yen(sum(saves, "target")))}</span></div>
       <p class="muted small" style="margin-top:8px">目標ごとに「いま貯まっている金額」を管理します。ここの金額は口座残高の中での取り分け（目安）で、口座の残高そのものは変わりません。実際に別口座へお金を移すときは、入力タブの「振替」で記録してください。</p>
-    </div>
-    <div class="card">
-      <h3>目標の一覧</h3>
-      ${list.length ? list.map(g => {
-        const pct = goalProgress(g);
-        const done = (Number(g.target) || 0) > 0 && (Number(g.saved) || 0) >= (Number(g.target) || 0);
-        return `<div class="account-row">
-          <div class="row between">
-            <span class="cat-name">🎯 ${esc(g.name)}${done ? ` <span class="badge closed">達成🎉</span>` : ""}</span>
-            <span class="cat-amount">${pct}%</span>
-          </div>
-          <div class="bar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
-          <div class="row between" style="margin-top:4px">
-            <span class="muted small">${esc(yen(g.saved))} ／ ${esc(yen(g.target))}（あと ${esc(yen(Math.max(0, (Number(g.target) || 0) - (Number(g.saved) || 0))))}）</span>
-            <span class="row">
-              <button class="btn small" data-goal-add="${esc(g.id)}">貯める</button>
-              <button class="btn small" data-goal-edit="${esc(g.id)}">編集</button>
-            </span>
-          </div>
-        </div>`;
-      }).join("") : `<p class="empty">目標がまだありません。下から追加できます</p>`}
+      <div style="margin-top:6px">
+      ${saves.length ? saves.map(goalRowHTML).join("") : `<p class="empty">目標がまだありません。下から追加できます</p>`}
+      </div>
     </div>
     <div class="card">
       <h3>目標を追加</h3>
       <div class="field">
         <label>目標の名前</label>
-        <input type="text" id="new-goal-name" placeholder="例：11月生活費">
+        <input type="text" id="new-goal-name" placeholder="例：旅行資金">
       </div>
       <div class="field">
         <label>目標金額（円）</label>
@@ -1608,16 +1641,54 @@ function renderGoals() {
         <input type="number" id="new-goal-saved" inputmode="numeric" placeholder="0">
       </div>
       <button class="btn primary block" id="add-goal">目標を追加</button>
+    </div>
+    <div class="card">
+      <h3>💳 借金</h3>
+      <div class="row between"><span class="muted">残りの借金</span><span class="big-amount amount-expense">${esc(yen(debtRemaining()))}</span></div>
+      <div class="row between" style="margin-top:2px"><span class="muted">借入総額</span><span>${esc(yen(sum(debts, "target")))}</span></div>
+      <div class="row between" style="margin-top:2px"><span class="muted">返済済み</span><span>${esc(yen(sum(debts, "saved")))}</span></div>
+      <p class="muted small" style="margin-top:8px">借金ごとに返済の進み具合を管理します。ここでは進捗だけを記録し、口座残高は変わりません。実際の返済は支出として記録してください。</p>
+      <div style="margin-top:6px">
+      ${debts.length ? debts.map(goalRowHTML).join("") : `<p class="empty">借金がまだありません。下から追加できます</p>`}
+      </div>
+    </div>
+    <div class="card">
+      <h3>借金を追加</h3>
+      <div class="field">
+        <label>借金の名前</label>
+        <input type="text" id="new-debt-name" placeholder="例：住宅ローン">
+      </div>
+      <div class="field">
+        <label>借入総額（円）</label>
+        <input type="number" id="new-debt-target" inputmode="numeric" placeholder="0">
+      </div>
+      <div class="field">
+        <label>すでに返済した金額（円）</label>
+        <input type="number" id="new-debt-saved" inputmode="numeric" placeholder="0">
+      </div>
+      <button class="btn primary block" id="add-debt">借金を追加</button>
     </div>`;
 
   $("#add-goal").addEventListener("click", () => {
     const name = $("#new-goal-name").value.trim();
     if (!name) { toast("目標の名前を入力してください"); return; }
-    const target = Math.max(0, Math.round(Number($("#new-goal-target").value) || 0));
-    const saved = Math.max(0, Math.round(Number($("#new-goal-saved").value) || 0));
-    goals().push({ id: uid(), name, target, saved, createdAt: new Date().toISOString() });
+    goals().push({ id: uid(), kind: "save", name,
+      target: Math.max(0, Math.round(Number($("#new-goal-target").value) || 0)),
+      saved: Math.max(0, Math.round(Number($("#new-goal-saved").value) || 0)),
+      createdAt: new Date().toISOString() });
     saveData();
     toast("目標を追加しました");
+    renderGoals();
+  });
+  $("#add-debt").addEventListener("click", () => {
+    const name = $("#new-debt-name").value.trim();
+    if (!name) { toast("借金の名前を入力してください"); return; }
+    goals().push({ id: uid(), kind: "debt", name,
+      target: Math.max(0, Math.round(Number($("#new-debt-target").value) || 0)),
+      saved: Math.max(0, Math.round(Number($("#new-debt-saved").value) || 0)),
+      createdAt: new Date().toISOString() });
+    saveData();
+    toast("借金を追加しました");
     renderGoals();
   });
   $$("#tab-goals [data-goal-add]").forEach(b => b.addEventListener("click", () => {
@@ -1629,18 +1700,22 @@ function renderGoals() {
     if (g) openGoalEditModal(g);
   }));
 }
-/* 目標へ貯める／取り崩すモーダル（saved の増減だけ。口座残高は変えない） */
+/* 目標へ貯める／借金を返済するモーダル（saved の増減だけ。口座残高は変えない） */
 function openGoalSaveModal(goal) {
+  const L = GOAL_KIND_LABELS[goal.kind || "save"];
+  const rest = Math.max(0, (Number(goal.target) || 0) - (Number(goal.saved) || 0));
   openModal(`
-    <h3>🎯 ${esc(goal.name)}</h3>
-    <p class="muted small">現在 ${esc(yen(goal.saved))} ／ 目標 ${esc(yen(goal.target))}（${goalProgress(goal)}%）</p>
+    <h3>${L.icon} ${esc(goal.name)}</h3>
+    <p class="muted small">${goal.kind === "debt"
+      ? `返済済み ${esc(yen(goal.saved))} ／ 総額 ${esc(yen(goal.target))}（残り ${esc(yen(rest))}・${goalProgress(goal)}%）`
+      : `現在 ${esc(yen(goal.saved))} ／ 目標 ${esc(yen(goal.target))}（${goalProgress(goal)}%）`}</p>
     <div class="field">
       <label>金額（円）</label>
       <input type="number" id="goal-amt" inputmode="numeric" placeholder="0">
     </div>
     <div class="row" style="gap:8px">
-      <button class="btn" id="goal-sub" style="flex:1">取り崩す</button>
-      <button class="btn primary" id="goal-add" style="flex:2">貯める</button>
+      <button class="btn" id="goal-sub" style="flex:1">${L.sub}</button>
+      <button class="btn primary" id="goal-add" style="flex:2">${L.add}</button>
     </div>
     <button class="btn block" data-close style="margin-top:10px">やめる</button>`);
   $$("#modal-box [data-close]").forEach(b => b.addEventListener("click", closeModal));
@@ -1651,7 +1726,7 @@ function openGoalSaveModal(goal) {
     goal.saved = (Number(goal.saved) || 0) + amt;
     saveData();
     closeModal();
-    toast("貯金に加えました");
+    toast(L.addToast);
     renderTab();
   });
   $("#goal-sub").addEventListener("click", () => {
@@ -1660,49 +1735,64 @@ function openGoalSaveModal(goal) {
     goal.saved = Math.max(0, (Number(goal.saved) || 0) - amt);
     saveData();
     closeModal();
-    toast("取り崩しました");
+    toast(L.subToast);
     renderTab();
   });
 }
-/* 目標の編集モーダル（名前・目標金額・貯まっている金額の直接修正と削除） */
+/* 目標・借金の編集モーダル（種類の切り替え、名前・総額・進んだ金額の直接修正と削除） */
 function openGoalEditModal(goal) {
+  const L = GOAL_KIND_LABELS[goal.kind || "save"];
   openModal(`
-    <h3>目標の編集</h3>
+    <h3>${L.icon} 編集</h3>
     <div class="field">
-      <label>目標の名前</label>
+      <label>種類</label>
+      <select id="goal-kind-input">
+        <option value="save" ${(goal.kind || "save") === "save" ? "selected" : ""}>🎯 貯金目標</option>
+        <option value="debt" ${goal.kind === "debt" ? "selected" : ""}>💳 借金</option>
+      </select>
+    </div>
+    <div class="field">
+      <label id="goal-name-label">${L.nameLabel}</label>
       <input type="text" id="goal-name-input" value="${esc(goal.name)}">
     </div>
     <div class="field">
-      <label>目標金額（円）</label>
+      <label id="goal-target-label">${L.totalLabel}（円）</label>
       <input type="number" id="goal-target-input" inputmode="numeric" value="${esc(goal.target)}">
     </div>
     <div class="field">
-      <label>いま貯まっている金額（円）</label>
+      <label id="goal-saved-label">${L.savedLabel}（円）</label>
       <input type="number" id="goal-saved-input" inputmode="numeric" value="${esc(goal.saved)}">
     </div>
     <div class="row" style="gap:8px">
       <button class="btn" data-close style="flex:1">やめる</button>
       <button class="btn primary" id="goal-save" style="flex:2">保存</button>
     </div>
-    <button class="btn danger block" id="goal-del" style="margin-top:14px">この目標を削除する</button>`);
+    <button class="btn danger block" id="goal-del" style="margin-top:14px">この項目を削除する</button>`);
   $$("#modal-box [data-close]").forEach(b => b.addEventListener("click", closeModal));
+  $("#goal-kind-input").addEventListener("change", (ev) => {
+    const nl = GOAL_KIND_LABELS[ev.target.value];
+    $("#goal-name-label").textContent = nl.nameLabel;
+    $("#goal-target-label").textContent = nl.totalLabel + "（円）";
+    $("#goal-saved-label").textContent = nl.savedLabel + "（円）";
+  });
   $("#goal-save").addEventListener("click", () => {
     const name = $("#goal-name-input").value.trim();
-    if (!name) { toast("目標の名前を入力してください"); return; }
+    if (!name) { toast("名前を入力してください"); return; }
+    goal.kind = $("#goal-kind-input").value;
     goal.name = name;
     goal.target = Math.max(0, Math.round(Number($("#goal-target-input").value) || 0));
     goal.saved = Math.max(0, Math.round(Number($("#goal-saved-input").value) || 0));
     saveData();
     closeModal();
-    toast("目標を保存しました");
+    toast("保存しました");
     renderTab();
   });
   $("#goal-del").addEventListener("click", () => {
-    if (!confirm(`目標「${goal.name}」を削除しますか？`)) return;
+    if (!confirm(`「${goal.name}」を削除しますか？`)) return;
     state.data.goals = goals().filter(g => g.id !== goal.id);
     saveData();
     closeModal();
-    toast("目標を削除しました");
+    toast("削除しました");
     renderTab();
   });
 }
