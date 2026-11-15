@@ -221,6 +221,7 @@ function subscribeHousehold() {
        * JSONをインポート（または編集を保存）した時点で saveData 経由で作られる。 */
       sync.status = "synced";
       renderSyncStatus();
+      applyDueTransferRules();
       return;
     }
     const remote = snap.data();
@@ -235,6 +236,7 @@ function subscribeHousehold() {
     }
     sync.status = "synced";
     renderSyncStatus();
+    applyDueTransferRules();
   }, (e) => {
     console.error("snapshot error", e);
     sync.firstSnapshotDone = true;
@@ -289,9 +291,13 @@ const esc = (s) => String(s == null ? "" : s)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const yen = (n) => "¥" + Math.round(Number(n) || 0).toLocaleString("ja-JP");
-const uid = () => (window.crypto && crypto.randomUUID)
-  ? crypto.randomUUID()
-  : "id-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+const uid = () => {
+  const c = (typeof window !== "undefined" && window.crypto) ||
+    (typeof crypto !== "undefined" ? crypto : null);
+  return (c && c.randomUUID)
+    ? c.randomUUID()
+    : "id-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+};
 
 /* 月キー "YYYY-MM" の操作 */
 function monthKeyOf(date) {
@@ -365,6 +371,7 @@ function emptyData() {
     months: [],
     accounts: [],
     transfers: [],
+    transferRules: [],
     goals: []
   };
 }
@@ -376,7 +383,7 @@ const state = {
   history: { month: currentMonthKey(), catId: "", kind: "", member: "", accountId: "" },
   entry: { kind: "expense", amountStr: "", member: "共通", catId: null, accountId: null, editingId: null, editingMonth: null },
   compare: { baseMonth: currentMonthKey(), againstMonth: addMonths(currentMonthKey(), -1), kind: "expense" },
-  transfer: { fromId: null, toId: null },
+  transfer: { fromId: null, toId: null, note: "" },
   entryReturn: null,
   settings: { month: currentMonthKey() }
 };
@@ -417,6 +424,68 @@ function adjustTransferBalance(t, sign) {
   if (from) { from.balance = (Number(from.balance) || 0) - sign * amt; from.updatedAt = now; }
   if (to) { to.balance = (Number(to.balance) || 0) + sign * amt; to.updatedAt = now; }
 }
+/* ---------------- 定期振替 ----------------
+ * ルール（毎月○日／月末）に沿って、アプリを開いたタイミングで未記録分をまとめて作る。
+ * サーバー常駐ではないため「開いたとき実行」だが、日付は予定日で入るので実用上の差はない。
+ * 二重作成の防止は ruleId + period（月キー）の組み合わせで行う。 */
+function transferRules() { return state.data.transferRules || []; }
+function ruleDateForMonth(rule, monthKey) {
+  const parts = monthKey.split("-").map(Number);
+  const lastDay = new Date(parts[0], parts[1], 0).getDate();
+  const d = rule.day === 0 ? lastDay : Math.min(rule.day, lastDay);
+  return monthKey + "-" + String(d).padStart(2, "0");
+}
+let applyingTransferRules = false;
+function applyDueTransferRules(todayOverride) {
+  if (!state.data || applyingTransferRules) return 0;
+  applyingTransferRules = true;
+  try {
+    const today = todayOverride || todayStr();
+    const thisMonth = today.slice(0, 7);
+    let createdCount = 0;
+    for (const rule of transferRules()) {
+      if (!rule.active) continue;
+      if (!accountById(rule.fromId) || !accountById(rule.toId)) continue;
+      const createdDate = String(rule.createdAt || today).slice(0, 10);
+      let mk = createdDate.slice(0, 7);
+      while (mk <= thisMonth) {
+        const date = ruleDateForMonth(rule, mk);
+        const due = date <= today && date >= createdDate && (!rule.skipBefore || mk >= rule.skipBefore);
+        if (due && !transfers().some(t => t.ruleId === rule.id && t.period === mk)) {
+          const t = {
+            id: uid(), date, fromId: rule.fromId, toId: rule.toId,
+            amount: rule.amount, note: rule.note || "",
+            ruleId: rule.id, period: mk,
+            createdAt: new Date().toISOString()
+          };
+          transfers().push(t);
+          adjustTransferBalance(t, 1);
+          createdCount++;
+        }
+        mk = addMonths(mk, 1);
+      }
+    }
+    if (createdCount > 0) {
+      saveData();
+      toast("定期振替を" + createdCount + "件記録しました");
+      renderTab();
+    }
+    return createdCount;
+  } finally {
+    applyingTransferRules = false;
+  }
+}
+/* 振替1件の内容を入力フォームへコピーする（日付は今日になる） */
+function copyTransferToForm(t) {
+  state.entry.kind = "transfer";
+  state.transfer.fromId = t.fromId;
+  state.transfer.toId = t.toId;
+  state.transfer.note = t.note || "";
+  state.entry.amountStr = String(t.amount || "");
+  switchTab("entry");
+  toast("振替の内容をコピーしました（日付は今日です）");
+}
+
 /* ---------------- 貯金目標のヘルパー ---------------- */
 function goals() { return state.data.goals; }
 function goalById(id) { return goals().find(g => g.id === id) || null; }
@@ -573,6 +642,9 @@ function showApp() {
   $("#app").hidden = false;
   renderSyncStatus();
   renderTab();
+  /* オフライン閲覧（未ログイン）ではこの場で定期振替を反映する。
+   * ログイン時はスナップショット受信後に最新データで反映される */
+  if (!sync.user) applyDueTransferRules();
 }
 /* Firebase Auth の状態変化（ログイン/ログアウト）を受ける */
 function handleAuthState(user) {
@@ -1024,6 +1096,7 @@ function renderHistory() {
                 <div class="row between"><span style="font-weight:600">${esc(from ? from.name : "（削除された口座）")} → ${esc(to ? to.name : "（削除された口座）")}</span><b>${esc(yen(t.amount))}</b></div>
                 <div class="muted small">${esc(dateLabel)}${t.note ? " ・ " + esc(t.note) : ""}</div>
               </div>
+              <button class="btn small" data-tr-copy-hist="${esc(t.id)}">コピー</button>
               <button class="entry-del" data-tr-del-hist="${esc(t.id)}" title="削除">🗑</button>
             </div>`;
           }).join("") : `<p class="empty">この月の振替はありません</p>`)
@@ -1051,6 +1124,10 @@ function renderHistory() {
     deleteEntry(b.dataset.entryMonth, b.dataset.delEntry);
     toast("削除しました");
     renderHistory();
+  }));
+  $$("#tab-history [data-tr-copy-hist]").forEach(b => b.addEventListener("click", () => {
+    const t = transfers().find(x => x.id === b.dataset.trCopyHist);
+    if (t) copyTransferToForm(t);
   }));
   $$("#tab-history [data-tr-del-hist]").forEach(b => b.addEventListener("click", () => {
     if (!confirm("この振替の記録を削除しますか？（残高も元に戻ります）")) return;
@@ -1182,7 +1259,7 @@ function renderTransferForm() {
     </div>
     <div class="field">
       <label>メモ（任意）</label>
-      <input type="text" id="entry-tr-note" placeholder="例：ATMで引き出し／PayPayにチャージ" value="${esc($("#entry-tr-note") ? $("#entry-tr-note").value : "")}">
+      <input type="text" id="entry-tr-note" placeholder="例：ATMで引き出し／PayPayにチャージ" value="${esc($("#entry-tr-note") ? $("#entry-tr-note").value : (ts.note || ""))}">
     </div>
     <button class="btn primary block" id="entry-tr-save">振替を記録</button>
     <p class="muted small" style="margin-top:8px">振替は収支に数えません（口座・財布の残高だけが動きます）。</p>`;
@@ -1213,6 +1290,7 @@ function renderTransferForm() {
     adjustTransferBalance(t, 1);
     saveData();
     st.amountStr = "";
+    ts.note = "";
     toast("振替を記録しました");
     renderEntry();
     maybeApplyPendingRemote();
@@ -1225,7 +1303,46 @@ function renderTransferHistory() {
   const recent = transfers().slice().sort((a, b) =>
     String(b.date || "").localeCompare(String(a.date || "")) ||
     String(b.createdAt || "").localeCompare(String(a.createdAt || ""))).slice(0, 10);
+  const rules = transferRules();
+  const dayOptions = Array.from({ length: 28 }, (_, i) => i + 1)
+    .map(d => `<option value="${d}">${d}日</option>`).join("") + `<option value="0">月末</option>`;
   wrap.innerHTML = `<div class="card">
+    <h3>定期振替（毎月自動）</h3>
+    <p class="muted small">毎月同じ振替は、ここに登録しておくとアプリを開いたときに自動で記録されます（日付は予定日で入ります）。</p>
+    ${rules.length ? rules.map(r => {
+      const from = accountById(r.fromId), to = accountById(r.toId);
+      return `<div class="row" style="padding:7px 0; border-bottom:1px solid var(--line)">
+        <div style="flex:1; min-width:0">
+          <div class="row between"><span style="font-weight:600">${r.day === 0 ? "毎月末日" : "毎月" + r.day + "日"} ${esc(from ? from.name : "（削除された口座）")} → ${esc(to ? to.name : "（削除された口座）")}</span><b>${esc(yen(r.amount))}</b></div>
+          <div class="muted small">${r.note ? esc(r.note) + " ・ " : ""}${r.active ? "有効" : "停止中"}</div>
+        </div>
+        <button class="btn small" data-rule-toggle="${esc(r.id)}">${r.active ? "停止" : "再開"}</button>
+        <button class="entry-del" data-rule-del="${esc(r.id)}" title="削除">🗑</button>
+      </div>`;
+    }).join("") : `<p class="empty">定期振替はまだ登録されていません</p>`}
+    <div class="field" style="margin-top:10px">
+      <label>移動元</label>
+      <select id="rule-from">${accountOptionsGrouped(state.transfer.fromId)}</select>
+    </div>
+    <div class="field">
+      <label>移動先</label>
+      <select id="rule-to">${accountOptionsGrouped(state.transfer.toId)}</select>
+    </div>
+    <div class="field">
+      <label>金額（円）</label>
+      <input type="number" id="rule-amount" inputmode="numeric" placeholder="例：50000">
+    </div>
+    <div class="field">
+      <label>毎月の日付</label>
+      <select id="rule-day">${dayOptions}</select>
+    </div>
+    <div class="field">
+      <label>メモ（任意）</label>
+      <input type="text" id="rule-note" placeholder="例：生活費の移動">
+    </div>
+    <button class="btn block" id="rule-add">定期振替を追加</button>
+  </div>
+  <div class="card">
     <h3>最近の振替</h3>
     ${recent.length ? recent.map(t => {
       const from = accountById(t.fromId), to = accountById(t.toId);
@@ -1233,8 +1350,9 @@ function renderTransferHistory() {
       return `<div class="row" style="padding:7px 0; border-bottom:1px solid var(--line)">
         <div style="flex:1; min-width:0">
           <div class="row between"><span style="font-weight:600">${esc(from ? from.name : "（削除された口座）")} → ${esc(to ? to.name : "（削除された口座）")}</span><b>${esc(yen(t.amount))}</b></div>
-          <div class="muted small">${esc(dateLabel)}${t.note ? " ・ " + esc(t.note) : ""}</div>
+          <div class="muted small">${esc(dateLabel)}${t.note ? " ・ " + esc(t.note) : ""}${t.ruleId ? " ・ 定期" : ""}</div>
         </div>
+        <button class="btn small" data-tr-copy="${esc(t.id)}">コピー</button>
         <button class="entry-del" data-tr-del="${esc(t.id)}" title="削除">🗑</button>
       </div>`;
     }).join("") : `<p class="empty">振替の記録はまだありません</p>`}
@@ -1247,6 +1365,46 @@ function renderTransferHistory() {
     state.data.transfers = transfers().filter(x => x.id !== t.id);
     saveData();
     toast("振替の記録を削除しました");
+    renderEntry();
+  }));
+  $$("#transfer-history [data-tr-copy]").forEach(b => b.addEventListener("click", () => {
+    const t = transfers().find(x => x.id === b.dataset.trCopy);
+    if (t) copyTransferToForm(t);
+  }));
+  const ruleAddBtn = $("#rule-add");
+  if (ruleAddBtn) ruleAddBtn.addEventListener("click", () => {
+    const fromId = $("#rule-from").value, toId = $("#rule-to").value;
+    const amount = Math.round(Number($("#rule-amount").value) || 0);
+    if (fromId === toId) { toast("移動元と移動先が同じです"); return; }
+    if (!amount || amount <= 0) { toast("金額を入力してください"); return; }
+    transferRules().push({
+      id: uid(), fromId, toId, amount,
+      note: $("#rule-note").value.trim(),
+      day: Number($("#rule-day").value) || 0,
+      active: true, skipBefore: null,
+      createdAt: new Date().toISOString()
+    });
+    saveData();
+    toast("定期振替を追加しました");
+    renderEntry();
+    applyDueTransferRules();
+  });
+  $$("#transfer-history [data-rule-toggle]").forEach(b => b.addEventListener("click", () => {
+    const r = transferRules().find(x => x.id === b.dataset.ruleToggle);
+    if (!r) return;
+    r.active = !r.active;
+    /* 再開したときは、停止していた間の月はさかのぼって作らない（今月分から対象） */
+    if (r.active) r.skipBefore = currentMonthKey();
+    saveData();
+    toast(r.active ? "定期振替を再開しました" : "定期振替を停止しました");
+    renderEntry();
+    if (r.active) applyDueTransferRules();
+  }));
+  $$("#transfer-history [data-rule-del]").forEach(b => b.addEventListener("click", () => {
+    if (!confirm("この定期振替を削除しますか？（記録済みの振替は残ります）")) return;
+    state.data.transferRules = transferRules().filter(x => x.id !== b.dataset.ruleDel);
+    saveData();
+    toast("定期振替を削除しました");
     renderEntry();
   }));
 }
@@ -1579,7 +1737,22 @@ function normalizeData(data) {
       id: String(t.id), date: t.date || null,
       fromId: String(t.fromId), toId: String(t.toId),
       amount: Number(t.amount) || 0, note: String(t.note || ""),
+      ruleId: t.ruleId ? String(t.ruleId) : null,
+      period: t.period ? String(t.period) : null,
       createdAt: t.createdAt || null
+    }));
+  /* 定期振替ルール：毎月決まった日に同じ振替を自動記録するための設定。
+   * day は 1〜28、0 は月末。active=false は停止中。skipBefore（月キー）より前の月は対象外 */
+  d.transferRules = (Array.isArray(d.transferRules) ? d.transferRules : [])
+    .filter(r => r && r.id && r.fromId && r.toId && r.fromId !== r.toId && (Number(r.amount) || 0) > 0)
+    .map(r => ({
+      id: String(r.id),
+      fromId: String(r.fromId), toId: String(r.toId),
+      amount: Math.round(Number(r.amount) || 0), note: String(r.note || ""),
+      day: Math.min(28, Math.max(0, Math.round(Number(r.day) || 0))),
+      active: r.active !== false,
+      skipBefore: r.skipBefore ? String(r.skipBefore) : null,
+      createdAt: r.createdAt || null
     }));
   /* 貯金目標・借金：無いデータでは空配列にし、壊れた要素は落とす。金額は0以上の整数に丸める */
   d.goals = (Array.isArray(d.goals) ? d.goals : [])

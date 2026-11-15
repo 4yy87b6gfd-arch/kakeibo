@@ -149,6 +149,25 @@ const trResult = run(`(() => {
 assert.strictEqual(trResult, "t1|1|0", "振替フィルター（月／口座／指定なし）が効くこと");
 console.log("履歴の振替フィルターチェック OK");
 
+/* --- 定期振替の自動記録の検証 --- */
+run('toast = function () {}; renderTab = function () {};');
+run('state.data = normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], accounts: [{ id: "a1", name: "銀行", balance: 100000, type: "bank" }, { id: "a2", name: "現金", balance: 0, type: "cash" }], transfers: [], transferRules: [{ id: "r1", fromId: "a1", toId: "a2", amount: 5000, note: "生活費", day: 5, active: true, createdAt: "2026-09-10T00:00:00.000Z" }, { id: "r2", fromId: "a1", toId: "a2", amount: 1000, day: 0, active: true, createdAt: "2026-10-31T00:00:00.000Z" }, { id: "r3", fromId: "a1", toId: "a2", amount: 777, day: 1, active: false, createdAt: "2026-09-01T00:00:00.000Z" }] })');
+const dueResult = run(`(() => {
+  const c1 = applyDueTransferRules("2026-11-15");
+  const c2 = applyDueTransferRules("2026-11-15");
+  const a1 = state.data.accounts.find(a => a.id === "a1").balance;
+  const a2 = state.data.accounts.find(a => a.id === "a2").balance;
+  const autoCount = state.data.transfers.filter(t => t.ruleId).length;
+  const roundTrip = normalizeData(JSON.parse(JSON.stringify(state.data)));
+  const kept = roundTrip.transfers.filter(t => t.ruleId).length;
+  return c1 + "|" + c2 + "|" + a1 + "|" + a2 + "|" + autoCount + "|" + kept;
+})()`);
+/* r1: 9/5は登録日(9/10)より前で対象外、10/5と11/5の2件。r2(月末): 10/31の1件（11/30は未来）。
+ * 合計3件が初回で作られ、r3（停止中）は0件。残高は a1=100000-5000*2-1000=89000、a2=11000。
+ * 2回目の実行は二重作成なし・正規化でも ruleId が保持される */
+assert.strictEqual(dueResult, "3|0|89000|11000|3|3", "定期振替が期日分だけ作られ、二重作成されず、残高へ反映されること");
+console.log("定期振替チェック OK");
+
 /* --- 貯金目標の検証 --- */
 const gnorm = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], goals: [{ id: "g1", name: "太陽光＆蓄電池", target: 3499100, saved: 436950 }, { id: "g2", name: "", target: 100, saved: 0 }, { id: "g3", name: "マイナス", target: -5, saved: -10 }] })');
 assert.strictEqual(gnorm.goals.length, 2, "名前のない目標は落とされること");
