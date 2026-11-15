@@ -332,9 +332,12 @@ function toast(msg) {
  *               entries: [...], closed, incomeComplete, imported, ... } ]
  *   ※ パスワードは Firebase Auth で管理し、データ内には持たない。
  *     旧データや移行用JSONに auth が含まれていても normalizeData で除去する。
- *   accounts: [{ id, name, balance, updatedAt }]  // 口座と現在残高（手動管理）
+ *   accounts: [{ id, name, balance, updatedAt, isMain }]  // 口座と現在残高（手動管理）
+ *     isMain が true の口座は最大1つ。収入入力の初期選択になる「メイン口座」。
  *   entries の accountId（任意）: その記録が増減させる口座のID。
  *     記録の保存・編集・削除に合わせて adjustAccountBalance で残高を増減させる。
+ *   transfers: [{ id, date, fromId, toId, amount, note, createdAt }]  // 口座間の移動（振替）
+ *     収支には数えず、2口座の残高を adjustTransferBalance で移すだけ。
  * } */
 function emptyData() {
   return {
@@ -356,7 +359,8 @@ function emptyData() {
       pendingGroups: {}
     },
     months: [],
-    accounts: []
+    accounts: [],
+    transfers: []
   };
 }
 
@@ -390,6 +394,21 @@ function adjustAccountBalance(entryLike, sign) {
   if (!amt) return;
   acc.balance = (Number(acc.balance) || 0) + sign * (kind === "income" ? amt : -amt);
   acc.updatedAt = new Date().toISOString();
+}
+/* メイン口座（収入の入金先の初期選択）。未指定なら null */
+function mainAccount() { return accounts().find(a => a.isMain) || null; }
+/* 口座間の移動（振替）1件を残高へ加える（sign: 1=反映 / -1=取り消し）。
+ * 移動元を減らし、移動先を増やす。収支の集計には影響しない。 */
+function transfers() { return state.data.transfers || []; }
+function adjustTransferBalance(t, sign) {
+  if (!t) return;
+  const amt = Number(t.amount) || 0;
+  if (!amt) return;
+  const from = accountById(t.fromId);
+  const to = accountById(t.toId);
+  const now = new Date().toISOString();
+  if (from) { from.balance = (Number(from.balance) || 0) - sign * amt; from.updatedAt = now; }
+  if (to) { to.balance = (Number(to.balance) || 0) + sign * amt; to.updatedAt = now; }
 }
 
 function findMonth(key) {
@@ -997,6 +1016,10 @@ function renderEntryForm() {
   const memberOptions = ["共通"].concat(members());
   if (st.member && !memberOptions.includes(st.member)) memberOptions.push(st.member);
   const accs = accounts();
+  /* 収入は原則メイン口座に入るので、新規の収入入力ではメイン口座を初期選択にする
+   * （あとから別の口座・財布へ移すときは資産タブの「口座間の移動」で記録する） */
+  const mainAcc = mainAccount();
+  if (!st.editingId && st.kind === "income" && !st.accountId && mainAcc) st.accountId = mainAcc.id;
   body.innerHTML = `
     ${st.editingId ? `<p class="muted small" style="margin-top:10px">記録を編集中（${esc(monthLabel(st.editingMonth))}） <button class="btn small" id="entry-cancel-edit">編集をやめる</button></p>` : ""}
     <div class="amount-display ${amt === 0 ? "zero" : ""}">${esc(yen(amt))}</div>
@@ -1022,7 +1045,7 @@ function renderEntryForm() {
       </select>` : `<span class="muted">カテゴリーがありません（設定から追加できます）</span>`}
     </div>
     ${accs.length ? `<div class="field">
-      <label>口座（任意：選ぶと残高に反映されます）</label>
+      <label>${st.kind === "income" ? "入金先の口座（任意：選ぶと残高に反映されます）" : "支出元の口座・財布（任意：選ぶと残高に反映されます）"}</label>
       <select id="entry-account">
         <option value="" ${!st.accountId ? "selected" : ""}>指定なし</option>
         ${accs.map(a => `<option value="${esc(a.id)}" ${st.accountId === a.id ? "selected" : ""}>${esc(a.name)}（残高 ${esc(yen(a.balance))}）</option>`).join("")}
@@ -1296,7 +1319,25 @@ function normalizeData(data) {
     .filter(a => a && a.id && a.name)
     .map(a => ({
       id: String(a.id), name: String(a.name),
-      balance: Number(a.balance) || 0, updatedAt: a.updatedAt || null
+      balance: Number(a.balance) || 0, updatedAt: a.updatedAt || null,
+      isMain: !!a.isMain
+    }));
+  /* メイン口座は最大1つ（複数あれば先頭だけ残す） */
+  let mainSeen = false;
+  for (const a of d.accounts) {
+    if (a.isMain) {
+      if (mainSeen) a.isMain = false;
+      else mainSeen = true;
+    }
+  }
+  /* 口座間の移動（振替）：無いデータでは空配列にし、壊れた要素は落とす */
+  d.transfers = (Array.isArray(d.transfers) ? d.transfers : [])
+    .filter(t => t && t.id && t.fromId && t.toId && t.fromId !== t.toId && (Number(t.amount) || 0) > 0)
+    .map(t => ({
+      id: String(t.id), date: t.date || null,
+      fromId: String(t.fromId), toId: String(t.toId),
+      amount: Number(t.amount) || 0, note: String(t.note || ""),
+      createdAt: t.createdAt || null
     }));
   /* 集計設定（pendingGroups）がなければ、最新の月のgroupsを現在の設定として引き継ぐ */
   if (!d.settings.pendingGroups) {
@@ -1326,6 +1367,12 @@ function importFromFile(file) {
 function renderAssets() {
   const accs = accounts();
   const total = accs.reduce((a, x) => a + (Number(x.balance) || 0), 0);
+  const mainAcc = mainAccount();
+  const recentTransfers = transfers().slice().sort((a, b) =>
+    String(b.date || "").localeCompare(String(a.date || "")) ||
+    String(b.createdAt || "").localeCompare(String(a.createdAt || ""))).slice(0, 10);
+  const accOptions = (selectedId) => accs.map(a =>
+    `<option value="${esc(a.id)}" ${selectedId === a.id ? "selected" : ""}>${esc(a.name)}（残高 ${esc(yen(a.balance))}）</option>`).join("");
   $("#tab-assets").innerHTML = `
     <div class="card">
       <h3>口座の残高</h3>
@@ -1337,7 +1384,7 @@ function renderAssets() {
       ${accs.length ? accs.map(a => `
         <div class="account-row">
           <div class="row between">
-            <span class="cat-name">🏦 ${esc(a.name)}</span>
+            <span class="cat-name">🏦 ${esc(a.name)}${a.isMain ? ` <span class="badge closed">⭐メイン</span>` : ""}</span>
             <span class="cat-amount">${esc(yen(a.balance))}</span>
           </div>
           <div class="row between" style="margin-top:4px">
@@ -1349,6 +1396,45 @@ function renderAssets() {
           </div>
         </div>`).join("") : `<p class="empty">口座がまだありません。下から追加できます</p>`}
     </div>
+    ${accs.length >= 2 ? `<div class="card">
+      <h3>口座間の移動（振替）</h3>
+      <p class="muted small">生活費の移動など、口座・財布のあいだのお金の行き来を記録します。収支には数えません。</p>
+      <div class="field">
+        <label>移動元</label>
+        <select id="tr-from">${accOptions(mainAcc ? mainAcc.id : accs[0].id)}</select>
+      </div>
+      <div class="field">
+        <label>移動先</label>
+        <select id="tr-to">${accOptions((accs.find(a => !mainAcc || a.id !== mainAcc.id) || accs[0]).id)}</select>
+      </div>
+      <div class="field">
+        <label>金額（円）</label>
+        <input type="number" id="tr-amount" inputmode="numeric" placeholder="0">
+      </div>
+      <div class="field">
+        <label>日付</label>
+        <input type="date" id="tr-date" value="${esc(todayStr())}">
+      </div>
+      <div class="field">
+        <label>メモ（任意）</label>
+        <input type="text" id="tr-note" placeholder="例：11月の生活費">
+      </div>
+      <button class="btn primary block" id="add-transfer">移動を記録</button>
+    </div>
+    <div class="card">
+      <h3>最近の移動</h3>
+      ${recentTransfers.length ? recentTransfers.map(t => {
+        const from = accountById(t.fromId), to = accountById(t.toId);
+        const dateLabel = t.date ? t.date.slice(5).replace("-", "/") : "日付なし";
+        return `<div class="row" style="padding:7px 0; border-bottom:1px solid var(--line)">
+          <div style="flex:1; min-width:0">
+            <div class="row between"><span style="font-weight:600">${esc(from ? from.name : "（削除された口座）")} → ${esc(to ? to.name : "（削除された口座）")}</span><b>${esc(yen(t.amount))}</b></div>
+            <div class="muted small">${esc(dateLabel)}${t.note ? " ・ " + esc(t.note) : ""}</div>
+          </div>
+          <button class="entry-del" data-tr-del="${esc(t.id)}" title="削除">🗑</button>
+        </div>`;
+      }).join("") : `<p class="empty">移動の記録はまだありません</p>`}
+    </div>` : ""}
     <div class="card">
       <h3>口座を追加</h3>
       <div class="field">
@@ -1374,11 +1460,38 @@ function renderAssets() {
     const name = $("#new-acc-name").value.trim();
     if (!name) { toast("口座名を入力してください"); return; }
     const bal = Number($("#new-acc-balance").value) || 0;
-    accounts().push({ id: uid(), name, balance: Math.round(bal), updatedAt: new Date().toISOString() });
+    accounts().push({ id: uid(), name, balance: Math.round(bal), updatedAt: new Date().toISOString(), isMain: false });
     saveData();
     toast("口座を追加しました");
     renderAssets();
   });
+  const trBtn = $("#add-transfer");
+  if (trBtn) trBtn.addEventListener("click", () => {
+    const fromId = $("#tr-from").value, toId = $("#tr-to").value;
+    const amount = Math.round(Number($("#tr-amount").value) || 0);
+    if (fromId === toId) { toast("移動元と移動先が同じです"); return; }
+    if (!amount || amount <= 0) { toast("金額を入力してください"); return; }
+    const t = {
+      id: uid(), date: $("#tr-date").value || todayStr(),
+      fromId, toId, amount, note: $("#tr-note").value.trim(),
+      createdAt: new Date().toISOString()
+    };
+    transfers().push(t);
+    adjustTransferBalance(t, 1);
+    saveData();
+    toast("移動を記録しました");
+    renderAssets();
+  });
+  $$("#tab-assets [data-tr-del]").forEach(b => b.addEventListener("click", () => {
+    if (!confirm("この移動の記録を削除しますか？（残高も元に戻ります）")) return;
+    const t = transfers().find(x => x.id === b.dataset.trDel);
+    if (!t) return;
+    adjustTransferBalance(t, -1);
+    state.data.transfers = transfers().filter(x => x.id !== t.id);
+    saveData();
+    toast("移動の記録を削除しました");
+    renderAssets();
+  }));
 }
 /* 残高を実際の金額に合わせるモーダル */
 function openAccountBalanceModal(acc) {
@@ -1415,6 +1528,9 @@ function openAccountEditModal(acc) {
       <button class="btn" data-close style="flex:1">やめる</button>
       <button class="btn primary" id="acc-name-save" style="flex:2">保存</button>
     </div>
+    ${acc.isMain
+      ? `<p class="muted small" style="margin-top:14px">⭐ この口座がメイン口座です（収入入力のとき、入金先として最初に選ばれます）。</p>`
+      : `<button class="btn block" id="acc-set-main" style="margin-top:14px">⭐ メイン口座にする（収入の入金先）</button>`}
     <button class="btn danger block" id="acc-delete" style="margin-top:16px">この口座を削除</button>
     <p class="muted small">口座を削除しても過去の記録は消えません（記録に付いていた口座の表示だけ外れます）。</p>`);
   bindModalClose();
@@ -1425,6 +1541,14 @@ function openAccountEditModal(acc) {
     saveData();
     closeModal();
     toast("口座名を変更しました");
+    renderAssets();
+  });
+  const mainBtn = $("#acc-set-main");
+  if (mainBtn) mainBtn.addEventListener("click", () => {
+    for (const a of accounts()) a.isMain = a.id === acc.id;
+    saveData();
+    closeModal();
+    toast("メイン口座にしました");
     renderAssets();
   });
   $("#acc-delete").addEventListener("click", () => {
