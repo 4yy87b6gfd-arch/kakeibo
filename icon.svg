@@ -5,5 +5,9 @@
   <rect x="151" y="250" width="210" height="145" fill="#faf7f2"/>
   <circle cx="195" cy="300" r="14" fill="#4f7867"/>
   <circle cx="317" cy="300" r="14" fill="#4f7867"/>
-  <rect x="236" y="310" width="40" height="85" fill="#4f7867"/>
+  <rect x="216" y="310" width="40" height="85" fill="#4f7867"/>
+  <polygon points="368,322 416,322 403,288 381,288" fill="#e9c46a"/>
+  <ellipse cx="392" cy="364" rx="58" ry="52" fill="#e9c46a"/>
+  <rect x="362" y="310" width="60" height="20" rx="8" fill="#b88359"/>
+  <text x="392" y="368" font-family="sans-serif" font-size="56" font-weight="bold" fill="#7c4a12" text-anchor="middle" dominant-baseline="central">¥</text>
 </svg>
