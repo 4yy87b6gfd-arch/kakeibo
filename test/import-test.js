@@ -168,6 +168,15 @@ const dueResult = run(`(() => {
 assert.strictEqual(dueResult, "3|0|89000|11000|3|3", "定期振替が期日分だけ作られ、二重作成されず、残高へ反映されること");
 console.log("定期振替チェック OK");
 
+/* --- 特別な支出（生活費の集計から除外）の検証 --- */
+run('state.data = normalizeData({ settings: { members: ["健人", "知尋"], categories: [{ id: "food", name: "食費", kind: "expense", color: "#000", archived: false }], keywords: {} }, months: [{ month: "2026-11", budgets: {}, groups: {}, entries: [{ id: "e1", date: "2026-11-03", categoryId: "food", amount: 1000, member: "共通" }, { id: "e2", date: "2026-11-05", categoryId: "food", amount: 40000, member: "共通", excludeFromTotals: true }], closed: false }], accounts: [{ id: "a9", name: "ボーナス口座", balance: 0, type: "bank", isSpecial: true }] })');
+const specialResult = run(`(() => {
+  const m = state.data.months[0];
+  return totalOf(m, "expense") + "|" + specialTotal(m) + "|" + (state.data.accounts[0].isSpecial ? "1" : "0");
+})()`);
+assert.strictEqual(specialResult, "1000|40000|1", "特別フラグの支出が生活費の合計から外れ、別枠で数えられ、口座の特別マークが保持されること");
+console.log("特別な支出チェック OK");
+
 /* --- 貯金目標の検証 --- */
 const gnorm = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], goals: [{ id: "g1", name: "太陽光＆蓄電池", target: 3499100, saved: 436950 }, { id: "g2", name: "", target: 100, saved: 0 }, { id: "g3", name: "マイナス", target: -5, saved: -10 }] })');
 assert.strictEqual(gnorm.goals.length, 2, "名前のない目標は落とされること");

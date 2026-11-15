@@ -562,11 +562,23 @@ function sumByCategory(monthObj, kind) {
   const sums = {};
   if (!monthObj) return sums;
   for (const e of monthObj.entries) {
+    if (e.excludeFromTotals) continue; // 特別な支出は生活費の集計に入れない
     const cat = categoryById(e.categoryId);
     if (!cat || cat.kind !== kind) continue;
     sums[e.categoryId] = (sums[e.categoryId] || 0) + (Number(e.amount) || 0);
   }
   return sums;
+}
+/* 特別な支出（生活費の集計から外した支出）の合計。今月タブで別枠表示する用 */
+function specialTotal(monthObj) {
+  if (!monthObj) return 0;
+  let t = 0;
+  for (const e of monthObj.entries) {
+    if (!e.excludeFromTotals) continue;
+    const cat = categoryById(e.categoryId);
+    if (cat && cat.kind === "expense") t += Number(e.amount) || 0;
+  }
+  return t;
 }
 function totalOf(monthObj, kind) {
   const sums = sumByCategory(monthObj, kind);
@@ -576,6 +588,7 @@ function totalByMember(monthObj, kind, member) {
   if (!monthObj) return 0;
   let t = 0;
   for (const e of monthObj.entries) {
+    if (e.excludeFromTotals) continue;
     const cat = categoryById(e.categoryId);
     if (cat && cat.kind === kind && e.member === member) t += Number(e.amount) || 0;
   }
@@ -786,7 +799,7 @@ function entryRowHTML(e, monthKeyForEntry) {
     <span class="cat-dot" style="background:${cat ? cat.color : "#ccc"}"></span>
     <span class="entry-main">
       <span class="entry-note">${esc(note)}</span>
-      <span class="entry-meta">${esc(dateLabel)} ・ ${cat ? esc(cat.name) : "?"} ・ ${esc(e.member || "共通")}${e.recurring ? " ・ 固定費" : ""}${acc ? " ・ 🏦" + esc(acc.name) : ""}</span>
+      <span class="entry-meta">${esc(dateLabel)} ・ ${cat ? esc(cat.name) : "?"} ・ ${esc(e.member || "共通")}${e.recurring ? " ・ 固定費" : ""}${e.excludeFromTotals ? " ・ 特別" : ""}${acc ? " ・ 🏦" + esc(acc.name) : ""}</span>
     </span>
     <span class="entry-amount ${kind === "income" ? "amount-income" : "amount-expense"}">${kind === "income" ? "+" : "−"}${esc(yen(e.amount))}</span>
   </button>`;
@@ -797,6 +810,7 @@ function renderHome() {
   const prev = findMonth(addMonths(key, -1));
   const incTotal = totalOf(m, "income");
   const expTotal = totalOf(m, "expense");
+  const specialExp = specialTotal(m);
   const prevExpTotal = totalOf(prev, "expense");
   const budgetTotal = m ? Object.entries(m.budgets || {})
     .filter(([cid]) => { const c = categoryById(cid); return c && c.kind === "expense"; })
@@ -832,6 +846,7 @@ function renderHome() {
         <div class="row between" style="margin-top:6px"><span class="muted">支出（積立貯金を含む）</span><span class="big-amount amount-expense">${esc(yen(expTotal))}</span></div>
         <div class="row between"><span class="muted small">前月の支出</span><span class="small">${esc(yen(prevExpTotal))}</span></div>
         <div class="row between" style="margin-top:6px"><span class="muted">差し引き</span><b>${esc(yen(incTotal - expTotal))}</b></div>
+        ${specialExp ? `<div class="row between" style="margin-top:6px"><span class="muted small">特別な支出（生活費以外）</span><span class="small">${esc(yen(specialExp))}</span></div>` : ""}
       </div>
     </div>
 
@@ -990,6 +1005,7 @@ function openCopyFixed(targetKey) {
       target.entries.push({
         id: uid(), date, categoryId: e.categoryId, amount: e.amount,
         member: e.member || "共通", note: e.note || "", recurring: true,
+        excludeFromTotals: !!e.excludeFromTotals,
         source: "manual", createdAt: now
       });
     }
@@ -1039,9 +1055,11 @@ function renderHistory() {
   const list = filteredEntries(m);
   const tlist = isTransfer ? filteredTransfers(key) : [];
   const tsum = tlist.reduce((a, t) => a + (Number(t.amount) || 0), 0);
-  const inc = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "income"; })
+  const inc = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "income" && !e.excludeFromTotals; })
     .reduce((a, e) => a + (Number(e.amount) || 0), 0);
-  const exp = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "expense"; })
+  const exp = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "expense" && !e.excludeFromTotals; })
+    .reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const spc = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "expense" && e.excludeFromTotals; })
     .reduce((a, e) => a + (Number(e.amount) || 0), 0);
   const catOptions = categories().map(c =>
     `<option value="${esc(c.id)}" ${state.history.catId === c.id ? "selected" : ""}>${esc(c.name)}${c.archived ? "（非表示）" : ""}</option>`).join("");
@@ -1082,7 +1100,7 @@ function renderHistory() {
         <span class="muted small">表示中の合計</span>
         ${isTransfer
           ? `<span class="small">振替 <b>${esc(yen(tsum))}</b></span>`
-          : `<span class="small">収入 <b class="amount-income">${esc(yen(inc))}</b> ／ 支出 <b class="amount-expense">${esc(yen(exp))}</b></span>`}
+          : `<span class="small">収入 <b class="amount-income">${esc(yen(inc))}</b> ／ 支出 <b class="amount-expense">${esc(yen(exp))}</b>${spc ? ` ／ 特別 <b>${esc(yen(spc))}</b>` : ""}</span>`}
       </div>
       ${isTransfer ? "" : `<button class="btn small block" id="hist-csv" style="margin-top:10px">この一覧をCSVでダウンロード</button>`}
     </div>
@@ -1180,6 +1198,8 @@ function openEntryEditor(monthKey, entryId) {
   if (noteEl) noteEl.value = e.note || "";
   const recEl = $("#entry-recurring");
   if (recEl) recEl.checked = !!e.recurring;
+  const spEl = $("#entry-special");
+  if (spEl) spEl.checked = !!e.excludeFromTotals;
   renderEntryForm();
   toast("記録を編集中");
 }
@@ -1464,6 +1484,10 @@ function renderEntryForm() {
       <input type="checkbox" id="entry-recurring" ${$("#entry-recurring") && $("#entry-recurring").checked ? "checked" : ""}>
       毎月の記録として、翌月のコピー候補にする
     </label>
+    ${st.kind === "expense" ? `<label class="check-row">
+      <input type="checkbox" id="entry-special" ${$("#entry-special") && $("#entry-special").checked ? "checked" : ""}>
+      特別な支出（生活費の集計に入れない）
+    </label>` : ""}
     <button class="btn primary block" id="entry-save" style="margin-top:12px">${st.editingId ? "更新する" : "保存する"}</button>
     ${st.editingId ? `<button class="btn danger block" id="entry-delete" style="margin-top:8px">この記録を削除</button>` : ""}`;
 
@@ -1481,7 +1505,14 @@ function renderEntryForm() {
   const catSel = $("#entry-cat");
   if (catSel) catSel.addEventListener("change", (ev) => { st.catId = ev.target.value; });
   const accSel = $("#entry-account");
-  if (accSel) accSel.addEventListener("change", (ev) => { st.accountId = ev.target.value || null; });
+  if (accSel) accSel.addEventListener("change", (ev) => {
+    st.accountId = ev.target.value || null;
+    /* 特別支出用の口座を支出元に選んだら、「特別な支出」チェックを自動でONにする
+     * （手で外すこともできる。収入ではチェック自体が無いので何もしない） */
+    const acc = st.accountId ? accountById(st.accountId) : null;
+    const sp = $("#entry-special");
+    if (acc && acc.isSpecial && sp) sp.checked = true;
+  });
   const cancelBtn = $("#entry-cancel-edit");
   if (cancelBtn) cancelBtn.addEventListener("click", backFromEntryEdit);
   const delBtn = $("#entry-delete");
@@ -1504,6 +1535,8 @@ function saveEntryFromForm() {
   const dateVal = $("#entry-date").value || "";
   const note = $("#entry-note").value.trim();
   const recurring = $("#entry-recurring").checked;
+  const specialEl = $("#entry-special");
+  const special = !!(specialEl && specialEl.checked);
 
   if (st.editingId) {
     const m = findMonth(st.editingMonth);
@@ -1513,6 +1546,7 @@ function saveEntryFromForm() {
       const newMonthKey = dateVal ? dateVal.slice(0, 7) : st.editingMonth;
       e.amount = amount; e.categoryId = st.catId; e.member = st.member;
       e.note = note; e.recurring = recurring;
+      e.excludeFromTotals = special;
       e.date = dateVal || e.date || null;
       if (st.accountId) e.accountId = st.accountId; else delete e.accountId;
       adjustAccountBalance(before, -1); // 変更前の残高への影響を取り消してから
@@ -1543,6 +1577,7 @@ function saveEntryFromForm() {
     createdAt: new Date().toISOString()
   };
   if (st.accountId) newEntry.accountId = st.accountId;
+  if (special) newEntry.excludeFromTotals = true;
   m.entries.push(newEntry);
   adjustAccountBalance(newEntry, 1);
   m.updatedAt = new Date().toISOString();
@@ -1552,6 +1587,7 @@ function saveEntryFromForm() {
    * メイン口座を初期選択し直す（「収入はメイン口座に入る」ルール） */
   const n2 = $("#entry-note"); if (n2) n2.value = "";
   const r2 = $("#entry-recurring"); if (r2) r2.checked = false;
+  const s2 = $("#entry-special"); if (s2) s2.checked = false;
   resetEntryState(); // kind は維持。member=共通 / catId=null（=先頭のカテゴリー）/ accountId=null
   renderEntryForm();
   maybeApplyPendingRemote();
@@ -1672,14 +1708,14 @@ function downloadFile(name, content, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 3000);
 }
 function entriesToCSV(list, monthKeyFor) {
-  const head = ["月", "日付", "収支", "カテゴリー", "人", "メモ", "金額", "固定費"];
+  const head = ["月", "日付", "収支", "カテゴリー", "人", "メモ", "金額", "固定費", "特別"];
   const q = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
   const lines = [head.map(q).join(",")];
   for (const e of list) {
     const cat = categoryById(e.categoryId);
     lines.push([
       monthKeyFor(e), e.date || "", cat ? (cat.kind === "income" ? "収入" : "支出") : "",
-      cat ? cat.name : "", e.member || "共通", e.note || "", e.amount || 0, e.recurring ? "○" : ""
+      cat ? cat.name : "", e.member || "共通", e.note || "", e.amount || 0, e.recurring ? "○" : "", e.excludeFromTotals ? "○" : ""
     ].map(q).join(","));
   }
   return "﻿" + lines.join("\r\n");
@@ -1720,6 +1756,7 @@ function normalizeData(data) {
       id: String(a.id), name: String(a.name),
       balance: Number(a.balance) || 0, updatedAt: a.updatedAt || null,
       isMain: !!a.isMain,
+      isSpecial: !!a.isSpecial,
       type: ["bank", "cash", "emoney", "prepaid"].includes(a.type) ? a.type : "bank"
     }));
   /* メイン口座は最大1つ（複数あれば先頭だけ残す） */
@@ -2021,7 +2058,7 @@ function renderAssets() {
   const accountRow = (a) => `
         <div class="account-row">
           <div class="row between">
-            <span class="cat-name">🏦 ${esc(a.name)}${a.isMain ? ` <span class="badge closed">⭐メイン</span>` : ""}</span>
+            <span class="cat-name">🏦 ${esc(a.name)}${a.isMain ? ` <span class="badge closed">⭐メイン</span>` : ""}${a.isSpecial ? ` <span class="badge closed">特別支出用</span>` : ""}</span>
             <span class="cat-amount">${esc(yen(a.balance))}</span>
           </div>
           <div class="row between" style="margin-top:4px">
@@ -2130,6 +2167,10 @@ function openAccountEditModal(acc) {
     ${acc.isMain
       ? `<p class="muted small" style="margin-top:14px">⭐ この口座がメイン口座です（収入入力のとき、入金先として最初に選ばれます）。</p>`
       : `<button class="btn block" id="acc-set-main" style="margin-top:14px">⭐ メイン口座にする（収入の入金先）</button>`}
+    ${acc.isSpecial
+      ? `<button class="btn block" id="acc-unset-special" style="margin-top:8px">特別支出用を外す</button>
+         <p class="muted small">この口座は特別支出用です。支出元に選ぶと「特別な支出（生活費に入れない）」が自動でONになります。</p>`
+      : `<button class="btn block" id="acc-set-special" style="margin-top:8px">特別支出用にする（ボーナス口座など）</button>`}
     <button class="btn danger block" id="acc-delete" style="margin-top:16px">この口座を削除</button>
     <p class="muted small">口座を削除しても過去の記録は消えません（記録に付いていた口座の表示だけ外れます）。</p>`);
   bindModalClose();
@@ -2149,6 +2190,22 @@ function openAccountEditModal(acc) {
     saveData();
     closeModal();
     toast("メイン口座にしました");
+    renderAssets();
+  });
+  const setSpecialBtn = $("#acc-set-special");
+  if (setSpecialBtn) setSpecialBtn.addEventListener("click", () => {
+    acc.isSpecial = true;
+    saveData();
+    closeModal();
+    toast("特別支出用にしました");
+    renderAssets();
+  });
+  const unsetSpecialBtn = $("#acc-unset-special");
+  if (unsetSpecialBtn) unsetSpecialBtn.addEventListener("click", () => {
+    acc.isSpecial = false;
+    saveData();
+    closeModal();
+    toast("特別支出用を外しました");
     renderAssets();
   });
   $("#acc-delete").addEventListener("click", () => {
