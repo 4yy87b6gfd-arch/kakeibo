@@ -134,6 +134,21 @@ const histResult = run(`(() => {
 assert.strictEqual(histResult, "h1|h3|3", "口座フィルター（指定口座／指定なし／全て）が効くこと");
 console.log("履歴の口座フィルターチェック OK");
 
+/* --- 履歴の振替フィルターの検証 --- */
+run('state.data = normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], accounts: [{ id: "a1", name: "山口家現金", balance: 0, type: "cash" }, { id: "a2", name: "銀行", balance: 0, type: "bank" }], transfers: [{ id: "t1", date: "2026-11-05", fromId: "a2", toId: "a1", amount: 5000, note: "引き出し" }, { id: "t2", date: "2026-10-05", fromId: "a2", toId: "a1", amount: 3000 }] })');
+const trResult = run(`(() => {
+  state.history.accountId = "";
+  const nov = filteredTransfers("2026-11").map(t => t.id).join(",");
+  state.history.accountId = "a1";
+  const byAccount = filteredTransfers("2026-11").length;
+  state.history.accountId = "__none__";
+  const none = filteredTransfers("2026-11").length;
+  state.history.accountId = "";
+  return nov + "|" + byAccount + "|" + none;
+})()`);
+assert.strictEqual(trResult, "t1|1|0", "振替フィルター（月／口座／指定なし）が効くこと");
+console.log("履歴の振替フィルターチェック OK");
+
 /* --- 貯金目標の検証 --- */
 const gnorm = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], goals: [{ id: "g1", name: "太陽光＆蓄電池", target: 3499100, saved: 436950 }, { id: "g2", name: "", target: 100, saved: 0 }, { id: "g3", name: "マイナス", target: -5, saved: -10 }] })');
 assert.strictEqual(gnorm.goals.length, 2, "名前のない目標は落とされること");

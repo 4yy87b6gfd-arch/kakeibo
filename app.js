@@ -947,10 +947,26 @@ function filteredEntries(monthObj) {
     String(b.date || "9999").localeCompare(String(a.date || "9999")) ||
     String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 }
+/* 履歴タブ用：その月の振替を絞り込む（口座フィルター対応。
+ * 口座指定時は移動元・移動先のどちらかが一致すれば対象、「指定なし」では振替は出ない） */
+function filteredTransfers(monthKey) {
+  const h = state.history;
+  return transfers().filter(t => {
+    if (!t.date || t.date.slice(0, 7) !== monthKey) return false;
+    if (h.accountId === "__none__") return false;
+    if (h.accountId && t.fromId !== h.accountId && t.toId !== h.accountId) return false;
+    return true;
+  }).sort((a, b) =>
+    String(b.date || "").localeCompare(String(a.date || "")) ||
+    String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
 function renderHistory() {
   const key = state.history.month;
   const m = findMonth(key);
+  const isTransfer = state.history.kind === "transfer";
   const list = filteredEntries(m);
+  const tlist = isTransfer ? filteredTransfers(key) : [];
+  const tsum = tlist.reduce((a, t) => a + (Number(t.amount) || 0), 0);
   const inc = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "income"; })
     .reduce((a, e) => a + (Number(e.amount) || 0), 0);
   const exp = list.filter(e => { const c = categoryById(e.categoryId); return c && c.kind === "expense"; })
@@ -967,7 +983,7 @@ function renderHistory() {
     <div class="card">
       <div class="row between">
         <h3 style="margin:0">記録の一覧</h3>
-        <span class="muted">${list.length}件</span>
+        <span class="muted">${isTransfer ? tlist.length : list.length}件</span>
       </div>
       <div class="filter-grid" style="margin-top:10px">
         <select id="flt-cat"><option value="">全カテゴリー</option>${catOptions}</select>
@@ -975,6 +991,7 @@ function renderHistory() {
           <option value="" ${state.history.kind === "" ? "selected" : ""}>収支すべて</option>
           <option value="expense" ${state.history.kind === "expense" ? "selected" : ""}>支出</option>
           <option value="income" ${state.history.kind === "income" ? "selected" : ""}>収入</option>
+          <option value="transfer" ${state.history.kind === "transfer" ? "selected" : ""}>振替</option>
         </select>
         <select id="flt-member">
           <option value="" ${state.history.member === "" ? "selected" : ""}>全員</option>
@@ -991,16 +1008,30 @@ function renderHistory() {
       </div>` : ""}
       <div class="row between" style="margin-top:10px">
         <span class="muted small">表示中の合計</span>
-        <span class="small">収入 <b class="amount-income">${esc(yen(inc))}</b> ／ 支出 <b class="amount-expense">${esc(yen(exp))}</b></span>
+        ${isTransfer
+          ? `<span class="small">振替 <b>${esc(yen(tsum))}</b></span>`
+          : `<span class="small">収入 <b class="amount-income">${esc(yen(inc))}</b> ／ 支出 <b class="amount-expense">${esc(yen(exp))}</b></span>`}
       </div>
-      <button class="btn small block" id="hist-csv" style="margin-top:10px">この一覧をCSVでダウンロード</button>
+      ${isTransfer ? "" : `<button class="btn small block" id="hist-csv" style="margin-top:10px">この一覧をCSVでダウンロード</button>`}
     </div>
     <div class="card">
-      ${list.length ? list.map(e => `<div class="row" style="gap:0">
+      ${isTransfer
+        ? (tlist.length ? tlist.map(t => {
+            const from = accountById(t.fromId), to = accountById(t.toId);
+            const dateLabel = t.date ? t.date.slice(5).replace("-", "/") : "日付なし";
+            return `<div class="row" style="padding:7px 0; border-bottom:1px solid var(--line)">
+              <div style="flex:1; min-width:0">
+                <div class="row between"><span style="font-weight:600">${esc(from ? from.name : "（削除された口座）")} → ${esc(to ? to.name : "（削除された口座）")}</span><b>${esc(yen(t.amount))}</b></div>
+                <div class="muted small">${esc(dateLabel)}${t.note ? " ・ " + esc(t.note) : ""}</div>
+              </div>
+              <button class="entry-del" data-tr-del-hist="${esc(t.id)}" title="削除">🗑</button>
+            </div>`;
+          }).join("") : `<p class="empty">この月の振替はありません</p>`)
+        : (list.length ? list.map(e => `<div class="row" style="gap:0">
           <div style="flex:1;min-width:0">${entryRowHTML(e, key)}</div>
           <button class="entry-del" data-del-entry="${esc(e.id)}" data-entry-month="${esc(key)}" title="削除">🗑</button>
         </div>`).join("")
-        : `<p class="empty">条件に合う記録がありません</p>`}
+        : `<p class="empty">条件に合う記録がありません</p>`)}
     </div>`;
 
   $$("#tab-history [data-act]").forEach(btn => btn.addEventListener("click", () => {
@@ -1012,12 +1043,23 @@ function renderHistory() {
   $("#flt-member").addEventListener("change", (ev) => { state.history.member = ev.target.value; renderHistory(); });
   const fltAcc = $("#flt-account");
   if (fltAcc) fltAcc.addEventListener("change", (ev) => { state.history.accountId = ev.target.value; renderHistory(); });
-  $("#hist-csv").addEventListener("click", () => downloadCSV(list, key));
+  const csvBtn = $("#hist-csv");
+  if (csvBtn) csvBtn.addEventListener("click", () => downloadCSV(list, key));
   bindEntryEditButtons($("#tab-history"));
   $$("#tab-history [data-del-entry]").forEach(b => b.addEventListener("click", () => {
     if (!confirm("この記録を削除しますか？")) return;
     deleteEntry(b.dataset.entryMonth, b.dataset.delEntry);
     toast("削除しました");
+    renderHistory();
+  }));
+  $$("#tab-history [data-tr-del-hist]").forEach(b => b.addEventListener("click", () => {
+    if (!confirm("この振替の記録を削除しますか？（残高も元に戻ります）")) return;
+    const t = transfers().find(x => x.id === b.dataset.trDelHist);
+    if (!t) return;
+    adjustTransferBalance(t, -1);
+    state.data.transfers = transfers().filter(x => x.id !== t.id);
+    saveData();
+    toast("振替の記録を削除しました");
     renderHistory();
   }));
 }
