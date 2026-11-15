@@ -376,6 +376,7 @@ const state = {
   entry: { kind: "expense", amountStr: "", member: "共通", catId: null, accountId: null, editingId: null, editingMonth: null },
   compare: { baseMonth: currentMonthKey(), againstMonth: addMonths(currentMonthKey(), -1), kind: "expense" },
   transfer: { fromId: null, toId: null },
+  entryReturn: null,
   settings: { month: currentMonthKey() }
 };
 
@@ -1039,6 +1040,7 @@ function openEntryEditor(monthKey, entryId) {
     editingMonth: monthKey
   };
   $("#entry-date") && ($("#entry-date").value = e.date || (monthKey + "-01"));
+  if (state.tab !== "entry") state.entryReturn = state.tab; // 編集後に戻る先を覚える
   switchTab("entry");
   const dateEl = $("#entry-date");
   if (dateEl) dateEl.value = e.date || "";
@@ -1051,8 +1053,17 @@ function openEntryEditor(monthKey, entryId) {
 }
 
 /* ---------------- 入力タブ ---------------- */
+/* 編集を終えて、編集を開いたタブへ戻る（戻り先が無ければ入力タブに留まる） */
+function backFromEntryEdit() {
+  const dest = state.entryReturn;
+  resetEntryState();
+  state.entryReturn = null;
+  if (dest && dest !== "entry") switchTab(dest);
+  else renderEntry();
+}
 function renderEntry() {
   $("#tab-entry").innerHTML = `
+    ${state.entry.editingId ? `<div style="margin-bottom:10px"><button class="btn small" id="entry-back">← ${state.entryReturn === "home" ? "今月" : "履歴"}へ戻る</button></div>` : ""}
     <div class="card">
       <div class="seg">
         <button data-kind="expense" class="${state.entry.kind === "expense" ? "on expense-on" : ""}">支出</button>
@@ -1067,6 +1078,8 @@ function renderEntry() {
     state.entry.catId = null;
     renderEntry();
   }));
+  const backBtn = $("#entry-back");
+  if (backBtn) backBtn.addEventListener("click", backFromEntryEdit);
   if (state.entry.kind === "transfer") renderTransferForm();
   else renderEntryForm();
 }
@@ -1257,19 +1270,13 @@ function renderEntryForm() {
   const accSel = $("#entry-account");
   if (accSel) accSel.addEventListener("change", (ev) => { st.accountId = ev.target.value || null; });
   const cancelBtn = $("#entry-cancel-edit");
-  if (cancelBtn) cancelBtn.addEventListener("click", () => {
-    resetEntryState();
-    renderEntry();
-    const n = $("#entry-note"); if (n) n.value = "";
-    const d = $("#entry-date"); if (d) d.value = todayStr();
-  });
+  if (cancelBtn) cancelBtn.addEventListener("click", backFromEntryEdit);
   const delBtn = $("#entry-delete");
   if (delBtn) delBtn.addEventListener("click", () => {
     if (!confirm("この記録を削除しますか？")) return;
     deleteEntry(st.editingMonth, st.editingId);
-    resetEntryState();
+    backFromEntryEdit();
     toast("削除しました");
-    renderEntry();
   });
   $("#entry-save").addEventListener("click", saveEntryFromForm);
 }
@@ -1304,10 +1311,8 @@ function saveEntryFromForm() {
       m.updatedAt = new Date().toISOString();
     }
     saveData();
-    resetEntryState();
+    backFromEntryEdit();
     toast("更新しました");
-    renderEntry();
-    const n = $("#entry-note"); if (n) n.value = "";
     maybeApplyPendingRemote();
     return;
   }
