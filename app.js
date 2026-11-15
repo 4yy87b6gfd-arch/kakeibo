@@ -1347,9 +1347,12 @@ function saveEntryFromForm() {
   adjustAccountBalance(newEntry, 1);
   m.updatedAt = new Date().toISOString();
   saveData();
-  st.amountStr = "";
+  /* 登録後はプルダウン類を先頭に戻す（金額・メモ・固定費チェックもクリア）。
+   * 日付は連続して入力する都合でそのまま残す。収入の入金先は renderEntryForm が
+   * メイン口座を初期選択し直す（「収入はメイン口座に入る」ルール） */
   const n2 = $("#entry-note"); if (n2) n2.value = "";
   const r2 = $("#entry-recurring"); if (r2) r2.checked = false;
+  resetEntryState(); // kind は維持。member=共通 / catId=null（=先頭のカテゴリー）/ accountId=null
   renderEntryForm();
   maybeApplyPendingRemote();
   toast(monthLabel(monthKey) + "に保存しました");
