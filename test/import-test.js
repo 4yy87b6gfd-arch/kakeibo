@@ -177,6 +177,48 @@ const specialResult = run(`(() => {
 assert.strictEqual(specialResult, "1000|40000|1", "特別フラグの支出が生活費の合計から外れ、別枠で数えられ、口座の特別マークが保持されること");
 console.log("特別な支出チェック OK");
 
+/* --- 毎月の記録の自動コピーの検証 --- */
+const autoBase = (months, extra) => 'state.data = normalizeData({ settings: { members: ["健人", "知尋"], categories: [{ id: "salary", name: "給与", kind: "income", color: "#000", archived: false }, { id: "rent", name: "家賃", kind: "expense", color: "#111", archived: false }], keywords: {} }, months: ' + JSON.stringify(months) + ', accounts: [{ id: "a1", name: "メイン", balance: 0, type: "bank" }]' + (extra ? ", " + extra : "") + ' })';
+/* A: 基本（翌月へ2件・月末は30日に丸め・口座は引き継がない）＋二重防止＋消しても復活しない */
+run(autoBase([{ month: "2026-10", budgets: {}, groups: {}, entries: [
+  { id: "s1", date: "2026-10-25", categoryId: "salary", amount: 200000, member: "知尋", recurring: true, accountId: "a1" },
+  { id: "r1", date: "2026-10-31", categoryId: "rent", amount: 50000, member: "共通", recurring: true },
+  { id: "x1", date: "2026-10-03", categoryId: "rent", amount: 999, member: "共通" }
+], closed: false }]));
+const autoA = run(`(() => {
+  const c1 = applyRecurringCopies("2026-11-15");
+  const nov = state.data.months.find(m => m.month === "2026-11");
+  const dates = nov.entries.map(e => e.date).sort().join(",");
+  const hasAcc = nov.entries.some(e => e.accountId) ? "1" : "0";
+  const c2 = applyRecurringCopies("2026-11-15");
+  nov.entries = nov.entries.filter(e => e.copiedFrom !== "s1");
+  const c3 = applyRecurringCopies("2026-11-15");
+  return c1 + "|" + nov.entries.length + "|" + dates + "|" + hasAcc + "|" + c2 + "|" + c3;
+})()`);
+assert.strictEqual(autoA, "2|1|2026-11-25,2026-11-30|0|0|0", "自動コピーが翌月分を作り、二重作成せず、削除しても復活しないこと");
+/* B: 数か月開かなかった場合は途中の月を作りながら当月までつなぐ */
+run(autoBase([{ month: "2026-10", budgets: {}, groups: {}, entries: [
+  { id: "r1", date: "2026-10-05", categoryId: "rent", amount: 50000, member: "共通", recurring: true }
+], closed: false }], 'recurringAutoSince: "2026-11"'));
+const autoB = run(`(() => {
+  const c = applyRecurringCopies("2026-12-05");
+  const nov = state.data.months.find(m => m.month === "2026-11");
+  const dec = state.data.months.find(m => m.month === "2026-12");
+  return c + "|" + (nov ? nov.entries.length : -1) + "|" + (dec ? dec.entries.length : -1);
+})()`);
+assert.strictEqual(autoB, "2|1|1", "自動コピーが途中の月をつないで当月まで届くこと");
+/* C: 1/31 の記録は2月末（28日）に丸める */
+run(autoBase([{ month: "2026-01", budgets: {}, groups: {}, entries: [
+  { id: "r1", date: "2026-01-31", categoryId: "rent", amount: 50000, member: "共通", recurring: true }
+], closed: false }], 'recurringAutoSince: "2026-02"'));
+const autoC = run(`(() => {
+  applyRecurringCopies("2026-02-10");
+  const feb = state.data.months.find(m => m.month === "2026-02");
+  return feb && feb.entries.length ? feb.entries[0].date : "none";
+})()`);
+assert.strictEqual(autoC, "2026-02-28", "月末日のコピーが短い月に丸められること");
+console.log("自動コピーチェック OK");
+
 /* --- 貯金目標の検証 --- */
 const gnorm = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], goals: [{ id: "g1", name: "太陽光＆蓄電池", target: 3499100, saved: 436950 }, { id: "g2", name: "", target: 100, saved: 0 }, { id: "g3", name: "マイナス", target: -5, saved: -10 }] })');
 assert.strictEqual(gnorm.goals.length, 2, "名前のない目標は落とされること");

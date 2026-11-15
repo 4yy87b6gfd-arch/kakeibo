@@ -222,6 +222,7 @@ function subscribeHousehold() {
       sync.status = "synced";
       renderSyncStatus();
       applyDueTransferRules();
+      applyRecurringCopies();
       return;
     }
     const remote = snap.data();
@@ -237,6 +238,7 @@ function subscribeHousehold() {
     sync.status = "synced";
     renderSyncStatus();
     applyDueTransferRules();
+    applyRecurringCopies();
   }, (e) => {
     console.error("snapshot error", e);
     sync.firstSnapshotDone = true;
@@ -372,6 +374,8 @@ function emptyData() {
     accounts: [],
     transfers: [],
     transferRules: [],
+    recurringAutoSince: null,
+    recurringCopyLog: [],
     goals: []
   };
 }
@@ -475,6 +479,73 @@ function applyDueTransferRules(todayOverride) {
     applyingTransferRules = false;
   }
 }
+/* ---------------- 毎月の記録の自動コピー ----------------
+ * 「翌月のコピー候補にする」にチェックされた記録（固定費・給与など）を、
+ * 月が替わってアプリを開いたときに翌月分として自動で複製する。
+ * ・開始月（recurringAutoSince）より前には遡らない（過去の実績月を汚さない）
+ * ・コピー済みは copiedFrom と recurringCopyLog で管理し、二重作成しない。
+ *   自動コピーを手で消しても、ログが残っているので復活しない
+ * ・口座は引き継がない（手動コピーと同じ。残高は実際の入金・支払いが確定してから直す）
+ * ・数か月開かなかった場合は、途中の月を作りながら当月までつなぐ */
+let applyingRecurringCopies = false;
+function applyRecurringCopies(todayOverride) {
+  if (!state.data || applyingRecurringCopies) return 0;
+  applyingRecurringCopies = true;
+  try {
+    const today = todayOverride || todayStr();
+    const curKey = today.slice(0, 7);
+    let dirty = false;
+    if (!state.data.recurringAutoSince) {
+      state.data.recurringAutoSince = curKey;
+      dirty = true;
+    }
+    if (!Array.isArray(state.data.recurringCopyLog)) state.data.recurringCopyLog = [];
+    const log = state.data.recurringCopyLog;
+    let count = 0;
+    let srcKey = addMonths(state.data.recurringAutoSince, -1);
+    while (srcKey < curKey) {
+      const targetKey = addMonths(srcKey, 1);
+      const src = findMonth(srcKey);
+      const candidates = src ? src.entries.filter(e => e.recurring) : [];
+      if (candidates.length) {
+        const target = ensureMonth(targetKey);
+        for (const e of candidates) {
+          const logKey = e.id + "|" + targetKey;
+          if (log.includes(logKey)) continue;
+          if (target.entries.some(x => x.copiedFrom === e.id)) { log.push(logKey); continue; }
+          let date = null;
+          if (e.date) {
+            const lastDay = new Date(Number(targetKey.slice(0, 4)), Number(targetKey.slice(5, 7)), 0).getDate();
+            const day = Math.min(Number(e.date.slice(8, 10)) || 1, lastDay);
+            date = targetKey + "-" + String(day).padStart(2, "0");
+          }
+          target.entries.push({
+            id: uid(), date, categoryId: e.categoryId, amount: e.amount,
+            member: e.member || "共通", note: e.note || "", recurring: true,
+            excludeFromTotals: !!e.excludeFromTotals,
+            copiedFrom: e.id,
+            source: "auto-copy", createdAt: new Date().toISOString()
+          });
+          log.push(logKey);
+          count++;
+        }
+      }
+      srcKey = targetKey;
+    }
+    if (log.length > 500) state.data.recurringCopyLog = log.slice(-500);
+    if (count > 0) {
+      saveData();
+      toast("毎月の記録を " + count + " 件コピーしました（金額は先月と同じです）");
+      renderTab();
+    } else if (dirty) {
+      saveData();
+    }
+    return count;
+  } finally {
+    applyingRecurringCopies = false;
+  }
+}
+
 /* 振替1件の内容を入力フォームへコピーする（日付は今日になる） */
 function copyTransferToForm(t) {
   state.entry.kind = "transfer";
@@ -657,7 +728,7 @@ function showApp() {
   renderTab();
   /* オフライン閲覧（未ログイン）ではこの場で定期振替を反映する。
    * ログイン時はスナップショット受信後に最新データで反映される */
-  if (!sync.user) applyDueTransferRules();
+  if (!sync.user) { applyDueTransferRules(); applyRecurringCopies(); }
 }
 /* Firebase Auth の状態変化（ログイン/ログアウト）を受ける */
 function handleAuthState(user) {
@@ -979,7 +1050,8 @@ function openCopyFixed(targetKey) {
     <p class="muted">${esc(monthLabel(prevKey))} の固定費を ${esc(monthLabel(targetKey))} に登録します。コピーする項目を選んでください。</p>
     ${candidates.map((e, i) => {
       const cat = categoryById(e.categoryId);
-      const already = target.entries.some(t => t.categoryId === e.categoryId && t.amount === e.amount && t.note === e.note);
+      const already = target.entries.some(t => t.copiedFrom === e.id) ||
+        target.entries.some(t => t.categoryId === e.categoryId && t.amount === e.amount && t.note === e.note);
       return `<label class="check-row">
         <input type="checkbox" data-copy-idx="${i}" ${already ? "" : "checked"}>
         <span class="cat-dot" style="background:${cat ? cat.color : "#ccc"}"></span>
@@ -1006,8 +1078,13 @@ function openCopyFixed(targetKey) {
         id: uid(), date, categoryId: e.categoryId, amount: e.amount,
         member: e.member || "共通", note: e.note || "", recurring: true,
         excludeFromTotals: !!e.excludeFromTotals,
+        copiedFrom: e.id,
         source: "manual", createdAt: now
       });
+      /* 自動コピーと二重にならないよう、手動コピーも履歴に残す */
+      if (!Array.isArray(state.data.recurringCopyLog)) state.data.recurringCopyLog = [];
+      const logKey = e.id + "|" + targetKey;
+      if (!state.data.recurringCopyLog.includes(logKey)) state.data.recurringCopyLog.push(logKey);
     }
     saveData();
     closeModal();
@@ -1791,6 +1868,11 @@ function normalizeData(data) {
       skipBefore: r.skipBefore ? String(r.skipBefore) : null,
       createdAt: r.createdAt || null
     }));
+  /* 毎月の記録の自動コピー：開始月（これより前の月には遡らない）と、コピー済み記録
+   * （元記録ID|対象月。自動コピーを消しても復活させないための履歴） */
+  d.recurringAutoSince = d.recurringAutoSince ? String(d.recurringAutoSince) : null;
+  d.recurringCopyLog = (Array.isArray(d.recurringCopyLog) ? d.recurringCopyLog : [])
+    .filter(k => typeof k === "string").slice(-500);
   /* 貯金目標・借金：無いデータでは空配列にし、壊れた要素は落とす。金額は0以上の整数に丸める */
   d.goals = (Array.isArray(d.goals) ? d.goals : [])
     .filter(g => g && g.id && String(g.name || "").trim())
