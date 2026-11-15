@@ -1,4 +1,6 @@
 /* ふたりの家計簿 - styles.css（モバイルファースト） */
+/* hidden属性は常に最優先で隠す（display指定のある要素でも効かせる） */
+[hidden] { display: none !important; }
 :root {
   --bg: #faf7f2;
   --card: #ffffff;
