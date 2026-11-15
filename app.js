@@ -339,6 +339,8 @@ function toast(msg) {
  *     記録の保存・編集・削除に合わせて adjustAccountBalance で残高を増減させる。
  *   transfers: [{ id, date, fromId, toId, amount, note, createdAt }]  // 口座間の移動（振替）
  *     収支には数えず、2口座の残高を adjustTransferBalance で移すだけ。
+ *   goals: [{ id, name, target, saved, createdAt }]  // 貯金目標
+ *     saved は「この目的のために確保している金額」の目安で、口座残高そのものは変えない。
  * } */
 function emptyData() {
   return {
@@ -361,7 +363,8 @@ function emptyData() {
     },
     months: [],
     accounts: [],
-    transfers: []
+    transfers: [],
+    goals: []
   };
 }
 
@@ -411,6 +414,16 @@ function adjustTransferBalance(t, sign) {
   const now = new Date().toISOString();
   if (from) { from.balance = (Number(from.balance) || 0) - sign * amt; from.updatedAt = now; }
   if (to) { to.balance = (Number(to.balance) || 0) + sign * amt; to.updatedAt = now; }
+}
+/* ---------------- 貯金目標のヘルパー ---------------- */
+function goals() { return state.data.goals; }
+function goalById(id) { return goals().find(g => g.id === id) || null; }
+/* 進捗率（0〜100の整数）。目標額が0なら、貯まっていれば100・なければ0 */
+function goalProgress(g) {
+  const target = Number(g.target) || 0;
+  const saved = Number(g.saved) || 0;
+  if (target <= 0) return saved > 0 ? 100 : 0;
+  return Math.min(100, Math.floor(saved / target * 100));
 }
 /* 口座の種別。資産タブでは種別ごとに一覧を分けて表示する */
 const ACCOUNT_TYPES = [
@@ -628,7 +641,7 @@ function switchTab(tab) {
   state.tab = tab;
   if (tab !== "entry") maybeApplyPendingRemote();
   $$(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
-  ["home", "history", "entry", "compare", "assets", "settings"].forEach(t => {
+  ["home", "history", "entry", "compare", "assets", "goals", "settings"].forEach(t => {
     $("#tab-" + t).hidden = t !== tab;
   });
   renderTab();
@@ -640,6 +653,7 @@ function renderTab() {
   else if (state.tab === "entry") renderEntry();
   else if (state.tab === "compare") renderCompare();
   else if (state.tab === "assets") renderAssets();
+  else if (state.tab === "goals") renderGoals();
   else if (state.tab === "settings") renderSettings();
 }
 
@@ -756,6 +770,17 @@ function renderHome() {
       ${accs.slice(0, 4).map(a => `<div class="row between"><span>🏦 ${esc(a.name)}</span><span>${esc(yen(a.balance))}</span></div>`).join("")}
     </div>` : ""}
 
+    ${goals().length ? `<div class="card">
+      <div class="row between">
+        <h3 style="margin:0">貯金目標</h3>
+        <button class="btn small" data-act="goto-goals">目標タブで管理</button>
+      </div>
+      ${goals().slice(0, 3).map(g => { const pct = goalProgress(g); return `<div style="margin-top:8px">
+        <div class="row between"><span>🎯 ${esc(g.name)}</span><span class="small">${esc(yen(g.saved))} ／ ${esc(yen(g.target))}（${pct}%）</span></div>
+        <div class="bar" style="margin-top:4px"><i style="width:${pct}%"></i></div>
+      </div>`; }).join("")}
+    </div>` : ""}
+
     <div class="card">
       <h3>今月の予算</h3>
       ${budgetTotal > 0 ? `
@@ -830,6 +855,7 @@ function renderHome() {
       renderHome();
     }
     else if (act === "goto-assets") { switchTab("assets"); }
+    else if (act === "goto-goals") { switchTab("goals"); }
     else if (act === "copy-fixed") openCopyFixed(key);
   }));
   bindEntryEditButtons($("#tab-home"));
@@ -1492,6 +1518,15 @@ function normalizeData(data) {
       amount: Number(t.amount) || 0, note: String(t.note || ""),
       createdAt: t.createdAt || null
     }));
+  /* 貯金目標：無いデータでは空配列にし、壊れた要素は落とす。金額は0以上の整数に丸める */
+  d.goals = (Array.isArray(d.goals) ? d.goals : [])
+    .filter(g => g && g.id && String(g.name || "").trim())
+    .map(g => ({
+      id: String(g.id), name: String(g.name),
+      target: Math.max(0, Math.round(Number(g.target) || 0)),
+      saved: Math.max(0, Math.round(Number(g.saved) || 0)),
+      createdAt: g.createdAt || null
+    }));
   /* 集計設定（pendingGroups）がなければ、最新の月のgroupsを現在の設定として引き継ぐ */
   if (!d.settings.pendingGroups) {
     const latest = d.months.length ? d.months[d.months.length - 1] : null;
@@ -1517,6 +1552,156 @@ function importFromFile(file) {
 }
 
 /* ---------------- 資産タブ（口座・残高の手動管理） ---------------- */
+/* ---------------- 貯金目標タブ ----------------
+ * 目標ごとの「目標金額」と「いま確保している金額（saved）」を管理する。
+ * saved は目安の取り分け表示で、口座残高そのものは変えない（実際に口座間で
+ * お金を動かすときは入力タブの「振替」を使う）。 */
+function renderGoals() {
+  const list = goals();
+  const totalTarget = list.reduce((s, g) => s + (Number(g.target) || 0), 0);
+  const totalSaved = list.reduce((s, g) => s + (Number(g.saved) || 0), 0);
+  $("#tab-goals").innerHTML = `
+    <div class="card">
+      <h3>貯金目標</h3>
+      <div class="row between"><span class="muted">貯めた合計</span><span class="big-amount">${esc(yen(totalSaved))}</span></div>
+      <div class="row between" style="margin-top:2px"><span class="muted">目標の合計</span><span>${esc(yen(totalTarget))}</span></div>
+      <p class="muted small" style="margin-top:8px">目標ごとに「いま貯まっている金額」を管理します。ここの金額は口座残高の中での取り分け（目安）で、口座の残高そのものは変わりません。実際に別口座へお金を移すときは、入力タブの「振替」で記録してください。</p>
+    </div>
+    <div class="card">
+      <h3>目標の一覧</h3>
+      ${list.length ? list.map(g => {
+        const pct = goalProgress(g);
+        const done = (Number(g.target) || 0) > 0 && (Number(g.saved) || 0) >= (Number(g.target) || 0);
+        return `<div class="account-row">
+          <div class="row between">
+            <span class="cat-name">🎯 ${esc(g.name)}${done ? ` <span class="badge closed">達成🎉</span>` : ""}</span>
+            <span class="cat-amount">${pct}%</span>
+          </div>
+          <div class="bar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
+          <div class="row between" style="margin-top:4px">
+            <span class="muted small">${esc(yen(g.saved))} ／ ${esc(yen(g.target))}（あと ${esc(yen(Math.max(0, (Number(g.target) || 0) - (Number(g.saved) || 0))))}）</span>
+            <span class="row">
+              <button class="btn small" data-goal-add="${esc(g.id)}">貯める</button>
+              <button class="btn small" data-goal-edit="${esc(g.id)}">編集</button>
+            </span>
+          </div>
+        </div>`;
+      }).join("") : `<p class="empty">目標がまだありません。下から追加できます</p>`}
+    </div>
+    <div class="card">
+      <h3>目標を追加</h3>
+      <div class="field">
+        <label>目標の名前</label>
+        <input type="text" id="new-goal-name" placeholder="例：11月生活費">
+      </div>
+      <div class="field">
+        <label>目標金額（円）</label>
+        <input type="number" id="new-goal-target" inputmode="numeric" placeholder="0">
+      </div>
+      <div class="field">
+        <label>いま貯まっている金額（円）</label>
+        <input type="number" id="new-goal-saved" inputmode="numeric" placeholder="0">
+      </div>
+      <button class="btn primary block" id="add-goal">目標を追加</button>
+    </div>`;
+
+  $("#add-goal").addEventListener("click", () => {
+    const name = $("#new-goal-name").value.trim();
+    if (!name) { toast("目標の名前を入力してください"); return; }
+    const target = Math.max(0, Math.round(Number($("#new-goal-target").value) || 0));
+    const saved = Math.max(0, Math.round(Number($("#new-goal-saved").value) || 0));
+    goals().push({ id: uid(), name, target, saved, createdAt: new Date().toISOString() });
+    saveData();
+    toast("目標を追加しました");
+    renderGoals();
+  });
+  $$("#tab-goals [data-goal-add]").forEach(b => b.addEventListener("click", () => {
+    const g = goalById(b.dataset.goalAdd);
+    if (g) openGoalSaveModal(g);
+  }));
+  $$("#tab-goals [data-goal-edit]").forEach(b => b.addEventListener("click", () => {
+    const g = goalById(b.dataset.goalEdit);
+    if (g) openGoalEditModal(g);
+  }));
+}
+/* 目標へ貯める／取り崩すモーダル（saved の増減だけ。口座残高は変えない） */
+function openGoalSaveModal(goal) {
+  openModal(`
+    <h3>🎯 ${esc(goal.name)}</h3>
+    <p class="muted small">現在 ${esc(yen(goal.saved))} ／ 目標 ${esc(yen(goal.target))}（${goalProgress(goal)}%）</p>
+    <div class="field">
+      <label>金額（円）</label>
+      <input type="number" id="goal-amt" inputmode="numeric" placeholder="0">
+    </div>
+    <div class="row" style="gap:8px">
+      <button class="btn" id="goal-sub" style="flex:1">取り崩す</button>
+      <button class="btn primary" id="goal-add" style="flex:2">貯める</button>
+    </div>
+    <button class="btn block" data-close style="margin-top:10px">やめる</button>`);
+  $$("#modal-box [data-close]").forEach(b => b.addEventListener("click", closeModal));
+  const readAmt = () => Math.round(Number($("#goal-amt").value) || 0);
+  $("#goal-add").addEventListener("click", () => {
+    const amt = readAmt();
+    if (!amt || amt <= 0) { toast("金額を入力してください"); return; }
+    goal.saved = (Number(goal.saved) || 0) + amt;
+    saveData();
+    closeModal();
+    toast("貯金に加えました");
+    renderTab();
+  });
+  $("#goal-sub").addEventListener("click", () => {
+    const amt = readAmt();
+    if (!amt || amt <= 0) { toast("金額を入力してください"); return; }
+    goal.saved = Math.max(0, (Number(goal.saved) || 0) - amt);
+    saveData();
+    closeModal();
+    toast("取り崩しました");
+    renderTab();
+  });
+}
+/* 目標の編集モーダル（名前・目標金額・貯まっている金額の直接修正と削除） */
+function openGoalEditModal(goal) {
+  openModal(`
+    <h3>目標の編集</h3>
+    <div class="field">
+      <label>目標の名前</label>
+      <input type="text" id="goal-name-input" value="${esc(goal.name)}">
+    </div>
+    <div class="field">
+      <label>目標金額（円）</label>
+      <input type="number" id="goal-target-input" inputmode="numeric" value="${esc(goal.target)}">
+    </div>
+    <div class="field">
+      <label>いま貯まっている金額（円）</label>
+      <input type="number" id="goal-saved-input" inputmode="numeric" value="${esc(goal.saved)}">
+    </div>
+    <div class="row" style="gap:8px">
+      <button class="btn" data-close style="flex:1">やめる</button>
+      <button class="btn primary" id="goal-save" style="flex:2">保存</button>
+    </div>
+    <button class="btn danger block" id="goal-del" style="margin-top:14px">この目標を削除する</button>`);
+  $$("#modal-box [data-close]").forEach(b => b.addEventListener("click", closeModal));
+  $("#goal-save").addEventListener("click", () => {
+    const name = $("#goal-name-input").value.trim();
+    if (!name) { toast("目標の名前を入力してください"); return; }
+    goal.name = name;
+    goal.target = Math.max(0, Math.round(Number($("#goal-target-input").value) || 0));
+    goal.saved = Math.max(0, Math.round(Number($("#goal-saved-input").value) || 0));
+    saveData();
+    closeModal();
+    toast("目標を保存しました");
+    renderTab();
+  });
+  $("#goal-del").addEventListener("click", () => {
+    if (!confirm(`目標「${goal.name}」を削除しますか？`)) return;
+    state.data.goals = goals().filter(g => g.id !== goal.id);
+    saveData();
+    closeModal();
+    toast("目標を削除しました");
+    renderTab();
+  });
+}
+
 function renderAssets() {
   const accs = accounts();
   const total = accs.reduce((a, x) => a + (Number(x.balance) || 0), 0);

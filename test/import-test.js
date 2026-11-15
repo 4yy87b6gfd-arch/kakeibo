@@ -134,6 +134,18 @@ const histResult = run(`(() => {
 assert.strictEqual(histResult, "h1|h3|3", "口座フィルター（指定口座／指定なし／全て）が効くこと");
 console.log("履歴の口座フィルターチェック OK");
 
+/* --- 貯金目標の検証 --- */
+const gnorm = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], goals: [{ id: "g1", name: "太陽光＆蓄電池", target: 3499100, saved: 436950 }, { id: "g2", name: "", target: 100, saved: 0 }, { id: "g3", name: "マイナス", target: -5, saved: -10 }] })');
+assert.strictEqual(gnorm.goals.length, 2, "名前のない目標は落とされること");
+assert.strictEqual(gnorm.goals[1].target, 0, "負の目標金額は0に丸められること");
+assert.strictEqual(gnorm.goals[1].saved, 0, "負の貯金額は0に丸められること");
+assert.strictEqual(run('goalProgress({ target: 200, saved: 50 })'), 25, "進捗率が計算できること");
+assert.strictEqual(run('goalProgress({ target: 100, saved: 125 })'), 100, "進捗率は100で頭打ちになること");
+assert.strictEqual(run('goalProgress({ target: 0, saved: 0 })'), 0, "目標0・貯金0は0%");
+assert.strictEqual(run('goalProgress({ target: 0, saved: 10 })'), 100, "目標0で貯金があれば100%");
+assert.strictEqual(run('normalizeData({ settings: { members: [], categories: [], keywords: {} }, months: [] }).goals.length'), 0, "goals が無いデータでは空配列になること");
+console.log("貯金目標チェック OK");
+
 /* --- 不正データの検証 --- */
 const bad = run('parseImportJSON("{\\"format\\":\\"other\\"}")');
 assert.strictEqual(bad.ok, false, "形式が違うJSONは拒否されること");
