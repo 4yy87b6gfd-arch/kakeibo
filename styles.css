@@ -30,6 +30,11 @@ body {
 }
 button { font: inherit; cursor: pointer; }
 input, select { font: inherit; }
+/* ダブルタップズーム防止（キーパッド連打などで画面が拡大しないようにする。
+   manipulation はスクロールとピンチズームを残したまま、ダブルタップ拡大だけを止める） */
+html, body, button, input, select, textarea, a { touch-action: manipulation; }
+/* iOS Safari はフォントサイズ16px未満の入力欄にフォーカスすると自動でズームする */
+input, select, textarea { font-size: 16px; }
 
 /* ===== ゲート ===== */
 .gate {
