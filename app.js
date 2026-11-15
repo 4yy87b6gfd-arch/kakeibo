@@ -632,7 +632,7 @@ function entryRowHTML(e, monthKeyForEntry) {
   return `<button class="entry-row" data-edit-entry="${esc(e.id)}" data-entry-month="${esc(monthKeyForEntry)}">
     <span class="cat-dot" style="background:${cat ? cat.color : "#ccc"}"></span>
     <span class="entry-main">
-      <span class="entry-note">${esc(note)}</span><br>
+      <span class="entry-note">${esc(note)}</span>
       <span class="entry-meta">${esc(dateLabel)} ・ ${cat ? esc(cat.name) : "?"} ・ ${esc(e.member || "共通")}${e.recurring ? " ・ 固定費" : ""}</span>
     </span>
     <span class="entry-amount ${kind === "income" ? "amount-income" : "amount-expense"}">${kind === "income" ? "+" : "−"}${esc(yen(e.amount))}</span>
@@ -867,7 +867,7 @@ function renderHistory() {
     </div>
     <div class="card">
       ${list.length ? list.map(e => `<div class="row" style="gap:0">
-          <div style="flex:1">${entryRowHTML(e, key)}</div>
+          <div style="flex:1;min-width:0">${entryRowHTML(e, key)}</div>
           <button class="entry-del" data-del-entry="${esc(e.id)}" data-entry-month="${esc(key)}" title="削除">🗑</button>
         </div>`).join("")
         : `<p class="empty">条件に合う記録がありません</p>`}
@@ -954,6 +954,9 @@ function renderEntryForm() {
   const cats = categories().filter(c => c.kind === st.kind && (!c.archived || c.id === st.catId));
   if (!st.catId || !cats.some(c => c.id === st.catId)) st.catId = cats.length ? cats[0].id : null;
   const memberLabel = st.kind === "income" ? "収入の対象者" : "使った人";
+  /* 選択中メンバーが現在のメンバー一覧にない場合（改名前の記録の編集など）も選択肢に含める */
+  const memberOptions = ["共通"].concat(members());
+  if (st.member && !memberOptions.includes(st.member)) memberOptions.push(st.member);
   body.innerHTML = `
     ${st.editingId ? `<p class="muted small" style="margin-top:10px">記録を編集中（${esc(monthLabel(st.editingMonth))}） <button class="btn small" id="entry-cancel-edit">編集をやめる</button></p>` : ""}
     <div class="amount-display ${amt === 0 ? "zero" : ""}">${esc(yen(amt))}</div>
@@ -967,17 +970,16 @@ function renderEntryForm() {
     </div>
     <div class="field">
       <label>${memberLabel}</label>
-      <div class="chips" id="entry-member-chips">
-        ${["共通"].concat(members()).map(n =>
-          `<button class="chip ${st.member === n ? "on" : ""}" data-member="${esc(n)}">${esc(n)}</button>`).join("")}
-      </div>
+      <select id="entry-member">
+        ${memberOptions.map(n =>
+          `<option value="${esc(n)}" ${st.member === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
+      </select>
     </div>
     <div class="field">
       <label>カテゴリー</label>
-      <div class="chips">
-        ${cats.map(c => `<button class="chip ${st.catId === c.id ? "on" : ""}" data-cat="${esc(c.id)}">
-          <span class="cat-dot" style="background:${c.color}"></span>${esc(c.name)}${c.archived ? "（非表示）" : ""}</button>`).join("") || `<span class="muted">カテゴリーがありません（設定から追加できます）</span>`}
-      </div>
+      ${cats.length ? `<select id="entry-cat">
+        ${cats.map(c => `<option value="${esc(c.id)}" ${st.catId === c.id ? "selected" : ""}>${esc(c.name)}${c.archived ? "（非表示）" : ""}</option>`).join("")}
+      </select>` : `<span class="muted">カテゴリーがありません（設定から追加できます）</span>`}
     </div>
     <div class="field">
       <label>メモ（任意：お店・品目など）</label>
@@ -1000,14 +1002,9 @@ function renderEntryForm() {
     disp.textContent = yen(v);
     disp.classList.toggle("zero", v === 0);
   }));
-  $$("#entry-member-chips [data-member]").forEach(b => b.addEventListener("click", () => {
-    st.member = b.dataset.member;
-    $$("#entry-member-chips [data-member]").forEach(x => x.classList.toggle("on", x.dataset.member === st.member));
-  }));
-  $$("#entry-form-body [data-cat]").forEach(b => b.addEventListener("click", () => {
-    st.catId = b.dataset.cat;
-    $$("#entry-form-body [data-cat]").forEach(x => x.classList.toggle("on", x.dataset.cat === st.catId));
-  }));
+  $("#entry-member").addEventListener("change", (ev) => { st.member = ev.target.value; });
+  const catSel = $("#entry-cat");
+  if (catSel) catSel.addEventListener("change", (ev) => { st.catId = ev.target.value; });
   const cancelBtn = $("#entry-cancel-edit");
   if (cancelBtn) cancelBtn.addEventListener("click", () => {
     resetEntryState();
@@ -1274,11 +1271,16 @@ function renderSettings() {
   };
   const catRow = (c) => {
     const parent = (state.data.settings.pendingGroups || {})[c.id] || "";
-    return `<div class="set-row" data-cat-row="${esc(c.id)}">
-      <span class="cat-dot" style="background:${c.color}"></span>
-      <input type="text" class="grow" data-f="name" value="${esc(c.name)}">
-      <select data-f="parent" title="集計先（新しい月から反映）">${parentOptions(c, parent)}</select>
-      <label class="switch" title="表示ON/OFF"><input type="checkbox" data-f="visible" ${c.archived ? "" : "checked"}><i></i></label>
+    return `<div class="cat-set-row" data-cat-row="${esc(c.id)}">
+      <div class="row">
+        <span class="cat-dot" style="background:${c.color}"></span>
+        <input type="text" class="grow" data-f="name" value="${esc(c.name)}">
+        <label class="switch" title="表示ON/OFF"><input type="checkbox" data-f="visible" ${c.archived ? "" : "checked"}><i></i></label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="muted small" style="flex:none">集計先</span>
+        <select data-f="parent" class="grow" title="集計先（新しい月から反映）">${parentOptions(c, parent)}</select>
+      </div>
     </div>`;
   };
 

@@ -65,6 +65,16 @@ const pg = run("Object.keys(state.data.settings.pendingGroups).length");
 assert.ok(pg > 0, "pendingGroups が初期化されていること");
 console.log("pendingGroups キー数 =", pg);
 
+/* pendingGroups の中身：expense-15〜21 の7件がすべて expense-14（その他）へ集計されること */
+const pgObj = run("state.data.settings.pendingGroups");
+const pgKeys = Object.keys(pgObj).sort();
+assert.deepStrictEqual(pgKeys,
+  ["expense-15", "expense-16", "expense-17", "expense-18", "expense-19", "expense-20", "expense-21"],
+  "pendingGroups のキーは expense-15〜21 の7件であること");
+assert.ok(pgKeys.every(k => pgObj[k] === "expense-14"),
+  "pendingGroups の集計先はすべて expense-14（その他）であること");
+console.log("pendingGroups 集計先 = すべて expense-14（その他）");
+
 /* --- 不正データの検証 --- */
 const bad = run('parseImportJSON("{\\"format\\":\\"other\\"}")');
 assert.strictEqual(bad.ok, false, "形式が違うJSONは拒否されること");
