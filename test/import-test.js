@@ -107,6 +107,14 @@ assert.strictEqual(norm.accounts.filter(a => a.isMain).length, 1, "メイン口�
 assert.strictEqual(norm.transfers.length, 1, "移動元と移動先が同じ振替は落とされること");
 console.log("振替・メイン口座チェック OK");
 
+/* --- 口座の種別の検証 --- */
+assert.strictEqual(norm.accounts[0].type, "bank", "種別が無い口座は銀行口座として正規化されること");
+const norm2 = run('normalizeData({ settings: { members: ["健人", "知尋"], categories: [], keywords: {} }, months: [], accounts: [{ id: "e1", name: "PayPay", balance: 500, type: "emoney" }, { id: "e2", name: "謎の財布", balance: 0, type: "xxx" }] })');
+assert.strictEqual(norm2.accounts[0].type, "emoney", "電子マネーの種別が保持されること");
+assert.strictEqual(norm2.accounts[1].type, "bank", "不正な種別は銀行口座に正規化されること");
+assert.strictEqual(run('accountTypeLabel("prepaid")'), "チャージ式", "種別ラベルが引けること");
+console.log("口座の種別チェック OK");
+
 /* --- 不正データの検証 --- */
 const bad = run('parseImportJSON("{\\"format\\":\\"other\\"}")');
 assert.strictEqual(bad.ok, false, "形式が違うJSONは拒否されること");
