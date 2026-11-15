@@ -115,6 +115,25 @@ assert.strictEqual(norm2.accounts[1].type, "bank", "不正な種別は銀行口�
 assert.strictEqual(run('accountTypeLabel("prepaid")'), "チャージ式", "種別ラベルが引けること");
 console.log("口座の種別チェック OK");
 
+/* --- 履歴の口座フィルターの検証 --- */
+run('state.data = normalizeData({ settings: { members: ["健人", "知尋"], categories: [{ id: "c1", name: "食費", kind: "expense" }], keywords: {} }, months: [], accounts: [{ id: "a1", name: "山口家現金", balance: 0, type: "cash" }, { id: "a2", name: "銀行", balance: 0, type: "bank" }] })');
+const histResult = run(`(() => {
+  const m = { key: "2026-11", entries: [
+    { id: "h1", date: "2026-11-03", categoryId: "c1", amount: 1000, member: "共通", accountId: "a1" },
+    { id: "h2", date: "2026-11-02", categoryId: "c1", amount: 2000, member: "共通", accountId: "a2" },
+    { id: "h3", date: "2026-11-01", categoryId: "c1", amount: 3000, member: "共通" }
+  ] };
+  state.history.accountId = "a1";
+  const byAccount = filteredEntries(m).map(e => e.id).join(",");
+  state.history.accountId = "__none__";
+  const noAccount = filteredEntries(m).map(e => e.id).join(",");
+  state.history.accountId = "";
+  const all = filteredEntries(m).length;
+  return byAccount + "|" + noAccount + "|" + all;
+})()`);
+assert.strictEqual(histResult, "h1|h3|3", "口座フィルター（指定口座／指定なし／全て）が効くこと");
+console.log("履歴の口座フィルターチェック OK");
+
 /* --- 不正データの検証 --- */
 const bad = run('parseImportJSON("{\\"format\\":\\"other\\"}")');
 assert.strictEqual(bad.ok, false, "形式が違うJSONは拒否されること");

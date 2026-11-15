@@ -369,7 +369,7 @@ const state = {
   data: null,
   tab: "home",
   home: { month: currentMonthKey(), kind: "expense", expanded: {} },
-  history: { month: currentMonthKey(), catId: "", kind: "", member: "" },
+  history: { month: currentMonthKey(), catId: "", kind: "", member: "", accountId: "" },
   entry: { kind: "expense", amountStr: "", member: "共通", catId: null, accountId: null, editingId: null, editingMonth: null },
   compare: { baseMonth: currentMonthKey(), againstMonth: addMonths(currentMonthKey(), -1), kind: "expense" },
   transfer: { fromId: null, toId: null },
@@ -900,6 +900,8 @@ function filteredEntries(monthObj) {
     if (h.catId && e.categoryId !== h.catId) return false;
     if (h.kind && (!cat || cat.kind !== h.kind)) return false;
     if (h.member && (e.member || "共通") !== h.member) return false;
+    if (h.accountId === "__none__" && e.accountId) return false;
+    if (h.accountId && h.accountId !== "__none__" && e.accountId !== h.accountId) return false;
     return true;
   }).sort((a, b) =>
     String(b.date || "9999").localeCompare(String(a.date || "9999")) ||
@@ -915,6 +917,10 @@ function renderHistory() {
     .reduce((a, e) => a + (Number(e.amount) || 0), 0);
   const catOptions = categories().map(c =>
     `<option value="${esc(c.id)}" ${state.history.catId === c.id ? "selected" : ""}>${esc(c.name)}${c.archived ? "（非表示）" : ""}</option>`).join("");
+  /* 口座フィルター：選んだ口座が消えていたら絞り込みを解除する */
+  const accs = accounts();
+  if (state.history.accountId && state.history.accountId !== "__none__" &&
+      !accs.some(a => a.id === state.history.accountId)) state.history.accountId = "";
 
   $("#tab-history").innerHTML = `
     ${monthNavHTML(key, "hist")}
@@ -936,6 +942,13 @@ function renderHistory() {
           ${members().map(n => `<option value="${esc(n)}" ${state.history.member === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
         </select>
       </div>
+      ${accs.length ? `<div style="margin-top:8px">
+        <select id="flt-account" style="width:100%">
+          <option value="" ${state.history.accountId === "" ? "selected" : ""}>全ての口座・財布</option>
+          ${accountOptionsGrouped(state.history.accountId)}
+          <option value="__none__" ${state.history.accountId === "__none__" ? "selected" : ""}>口座の指定なし</option>
+        </select>
+      </div>` : ""}
       <div class="row between" style="margin-top:10px">
         <span class="muted small">表示中の合計</span>
         <span class="small">収入 <b class="amount-income">${esc(yen(inc))}</b> ／ 支出 <b class="amount-expense">${esc(yen(exp))}</b></span>
@@ -957,6 +970,8 @@ function renderHistory() {
   $("#flt-cat").addEventListener("change", (ev) => { state.history.catId = ev.target.value; renderHistory(); });
   $("#flt-kind").addEventListener("change", (ev) => { state.history.kind = ev.target.value; renderHistory(); });
   $("#flt-member").addEventListener("change", (ev) => { state.history.member = ev.target.value; renderHistory(); });
+  const fltAcc = $("#flt-account");
+  if (fltAcc) fltAcc.addEventListener("change", (ev) => { state.history.accountId = ev.target.value; renderHistory(); });
   $("#hist-csv").addEventListener("click", () => downloadCSV(list, key));
   bindEntryEditButtons($("#tab-history"));
   $$("#tab-history [data-del-entry]").forEach(b => b.addEventListener("click", () => {
