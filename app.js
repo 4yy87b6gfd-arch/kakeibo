@@ -332,6 +332,9 @@ function toast(msg) {
  *               entries: [...], closed, incomeComplete, imported, ... } ]
  *   ※ パスワードは Firebase Auth で管理し、データ内には持たない。
  *     旧データや移行用JSONに auth が含まれていても normalizeData で除去する。
+ *   accounts: [{ id, name, balance, updatedAt }]  // 口座と現在残高（手動管理）
+ *   entries の accountId（任意）: その記録が増減させる口座のID。
+ *     記録の保存・編集・削除に合わせて adjustAccountBalance で残高を増減させる。
  * } */
 function emptyData() {
   return {
@@ -352,7 +355,8 @@ function emptyData() {
       keywords: {},
       pendingGroups: {}
     },
-    months: []
+    months: [],
+    accounts: []
   };
 }
 
@@ -361,7 +365,7 @@ const state = {
   tab: "home",
   home: { month: currentMonthKey(), kind: "expense", expanded: {} },
   history: { month: currentMonthKey(), catId: "", kind: "", member: "" },
-  entry: { kind: "expense", amountStr: "", member: "共通", catId: null, editingId: null, editingMonth: null },
+  entry: { kind: "expense", amountStr: "", member: "共通", catId: null, accountId: null, editingId: null, editingMonth: null },
   compare: { baseMonth: currentMonthKey(), againstMonth: addMonths(currentMonthKey(), -1), kind: "expense" },
   settings: { month: currentMonthKey() }
 };
@@ -369,6 +373,24 @@ const state = {
 function categories() { return state.data.settings.categories; }
 function categoryById(id) { return categories().find(c => c.id === id) || null; }
 function members() { return state.data.settings.members; }
+
+/* ---------------- 口座（資産） ---------------- */
+function accounts() { return state.data.accounts || []; }
+function accountById(id) { return accounts().find(a => a.id === id) || null; }
+/* 記録1件が口座残高へ与える影響を加える（sign: 1=反映 / -1=取り消し）。
+ * 収入は残高を増やし、支出は減らす。口座未指定・口座が無い場合は何もしない。
+ * 記録の保存・編集・削除のたびに呼び、残高を収支と一致させる。 */
+function adjustAccountBalance(entryLike, sign) {
+  if (!entryLike || !entryLike.accountId) return;
+  const acc = accountById(entryLike.accountId);
+  if (!acc) return;
+  const cat = categoryById(entryLike.categoryId);
+  const kind = cat ? cat.kind : "expense";
+  const amt = Number(entryLike.amount) || 0;
+  if (!amt) return;
+  acc.balance = (Number(acc.balance) || 0) + sign * (kind === "income" ? amt : -amt);
+  acc.updatedAt = new Date().toISOString();
+}
 
 function findMonth(key) {
   return state.data.months.find(m => m.month === key) || null;
@@ -565,7 +587,7 @@ function switchTab(tab) {
   state.tab = tab;
   if (tab !== "entry") maybeApplyPendingRemote();
   $$(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
-  ["home", "history", "entry", "compare", "settings"].forEach(t => {
+  ["home", "history", "entry", "compare", "assets", "settings"].forEach(t => {
     $("#tab-" + t).hidden = t !== tab;
   });
   renderTab();
@@ -576,6 +598,7 @@ function renderTab() {
   else if (state.tab === "history") renderHistory();
   else if (state.tab === "entry") renderEntry();
   else if (state.tab === "compare") renderCompare();
+  else if (state.tab === "assets") renderAssets();
   else if (state.tab === "settings") renderSettings();
 }
 
@@ -629,11 +652,12 @@ function entryRowHTML(e, monthKeyForEntry) {
   const kind = cat ? cat.kind : "expense";
   const dateLabel = e.date ? e.date.slice(5).replace("-", "/") : "日付なし";
   const note = e.note || (cat ? cat.name : "（不明なカテゴリー）");
+  const acc = e.accountId ? accountById(e.accountId) : null;
   return `<button class="entry-row" data-edit-entry="${esc(e.id)}" data-entry-month="${esc(monthKeyForEntry)}">
     <span class="cat-dot" style="background:${cat ? cat.color : "#ccc"}"></span>
     <span class="entry-main">
       <span class="entry-note">${esc(note)}</span>
-      <span class="entry-meta">${esc(dateLabel)} ・ ${cat ? esc(cat.name) : "?"} ・ ${esc(e.member || "共通")}${e.recurring ? " ・ 固定費" : ""}</span>
+      <span class="entry-meta">${esc(dateLabel)} ・ ${cat ? esc(cat.name) : "?"} ・ ${esc(e.member || "共通")}${e.recurring ? " ・ 固定費" : ""}${acc ? " ・ 🏦" + esc(acc.name) : ""}</span>
     </span>
     <span class="entry-amount ${kind === "income" ? "amount-income" : "amount-expense"}">${kind === "income" ? "+" : "−"}${esc(yen(e.amount))}</span>
   </button>`;
@@ -660,6 +684,8 @@ function renderHome() {
     return `<div class="row between"><span>${esc(name)}</span><b>${esc(yen(v))}</b></div>`;
   }).join("");
   const commonInc = totalByMember(m, "income", "共通");
+  const accs = accounts();
+  const accTotal = accs.reduce((a, x) => a + (Number(x.balance) || 0), 0);
 
   $("#tab-home").innerHTML = `
     ${monthNavHTML(key, "home")}
@@ -679,6 +705,15 @@ function renderHome() {
         <div class="row between" style="margin-top:6px"><span class="muted">差し引き</span><b>${esc(yen(incTotal - expTotal))}</b></div>
       </div>
     </div>
+
+    ${accs.length ? `<div class="card">
+      <div class="row between">
+        <h3 style="margin:0">口座の残高</h3>
+        <button class="btn small" data-act="goto-assets">資産タブで管理</button>
+      </div>
+      <div class="row between" style="margin-top:8px"><span class="muted">合計</span><b>${esc(yen(accTotal))}</b></div>
+      ${accs.slice(0, 4).map(a => `<div class="row between"><span>🏦 ${esc(a.name)}</span><span>${esc(yen(a.balance))}</span></div>`).join("")}
+    </div>` : ""}
 
     <div class="card">
       <h3>今月の予算</h3>
@@ -753,6 +788,7 @@ function renderHome() {
       state.home.expanded[id] = !state.home.expanded[id];
       renderHome();
     }
+    else if (act === "goto-assets") { switchTab("assets"); }
     else if (act === "copy-fixed") openCopyFixed(key);
   }));
   bindEntryEditButtons($("#tab-home"));
@@ -894,6 +930,8 @@ function renderHistory() {
 function deleteEntry(monthKey, entryId) {
   const m = findMonth(monthKey);
   if (!m) return;
+  const target = m.entries.find(e => e.id === entryId);
+  if (target) adjustAccountBalance(target, -1); // 口座残高への反映を取り消す
   m.entries = m.entries.filter(e => e.id !== entryId);
   m.updatedAt = new Date().toISOString();
   saveData();
@@ -914,6 +952,7 @@ function openEntryEditor(monthKey, entryId) {
     amountStr: String(e.amount || ""),
     member: e.member || "共通",
     catId: e.categoryId,
+    accountId: e.accountId || null,
     editingId: e.id,
     editingMonth: monthKey
   };
@@ -957,6 +996,7 @@ function renderEntryForm() {
   /* 選択中メンバーが現在のメンバー一覧にない場合（改名前の記録の編集など）も選択肢に含める */
   const memberOptions = ["共通"].concat(members());
   if (st.member && !memberOptions.includes(st.member)) memberOptions.push(st.member);
+  const accs = accounts();
   body.innerHTML = `
     ${st.editingId ? `<p class="muted small" style="margin-top:10px">記録を編集中（${esc(monthLabel(st.editingMonth))}） <button class="btn small" id="entry-cancel-edit">編集をやめる</button></p>` : ""}
     <div class="amount-display ${amt === 0 ? "zero" : ""}">${esc(yen(amt))}</div>
@@ -981,6 +1021,14 @@ function renderEntryForm() {
         ${cats.map(c => `<option value="${esc(c.id)}" ${st.catId === c.id ? "selected" : ""}>${esc(c.name)}${c.archived ? "（非表示）" : ""}</option>`).join("")}
       </select>` : `<span class="muted">カテゴリーがありません（設定から追加できます）</span>`}
     </div>
+    ${accs.length ? `<div class="field">
+      <label>口座（任意：選ぶと残高に反映されます）</label>
+      <select id="entry-account">
+        <option value="" ${!st.accountId ? "selected" : ""}>指定なし</option>
+        ${accs.map(a => `<option value="${esc(a.id)}" ${st.accountId === a.id ? "selected" : ""}>${esc(a.name)}（残高 ${esc(yen(a.balance))}）</option>`).join("")}
+        ${st.accountId && !accs.some(a => a.id === st.accountId) ? `<option value="${esc(st.accountId)}" selected>（削除された口座）</option>` : ""}
+      </select>
+    </div>` : ""}
     <div class="field">
       <label>メモ（任意：お店・品目など）</label>
       <input type="text" id="entry-note" placeholder="例：スーパーで食材" value="${esc($("#entry-note") ? $("#entry-note").value : "")}">
@@ -1005,6 +1053,8 @@ function renderEntryForm() {
   $("#entry-member").addEventListener("change", (ev) => { st.member = ev.target.value; });
   const catSel = $("#entry-cat");
   if (catSel) catSel.addEventListener("change", (ev) => { st.catId = ev.target.value; });
+  const accSel = $("#entry-account");
+  if (accSel) accSel.addEventListener("change", (ev) => { st.accountId = ev.target.value || null; });
   const cancelBtn = $("#entry-cancel-edit");
   if (cancelBtn) cancelBtn.addEventListener("click", () => {
     resetEntryState();
@@ -1023,7 +1073,7 @@ function renderEntryForm() {
   $("#entry-save").addEventListener("click", saveEntryFromForm);
 }
 function resetEntryState() {
-  state.entry = { kind: state.entry.kind, amountStr: "", member: "共通", catId: null, editingId: null, editingMonth: null };
+  state.entry = { kind: state.entry.kind, amountStr: "", member: "共通", catId: null, accountId: null, editingId: null, editingMonth: null };
 }
 function saveEntryFromForm() {
   const st = state.entry;
@@ -1038,10 +1088,14 @@ function saveEntryFromForm() {
     const m = findMonth(st.editingMonth);
     const e = m ? m.entries.find(x => x.id === st.editingId) : null;
     if (e) {
+      const before = { accountId: e.accountId || null, categoryId: e.categoryId, amount: e.amount };
       const newMonthKey = dateVal ? dateVal.slice(0, 7) : st.editingMonth;
       e.amount = amount; e.categoryId = st.catId; e.member = st.member;
       e.note = note; e.recurring = recurring;
       e.date = dateVal || e.date || null;
+      if (st.accountId) e.accountId = st.accountId; else delete e.accountId;
+      adjustAccountBalance(before, -1); // 変更前の残高への影響を取り消してから
+      adjustAccountBalance(e, 1);       // 変更後の内容で反映し直す
       if (newMonthKey !== st.editingMonth) {
         m.entries = m.entries.filter(x => x.id !== e.id);
         ensureMonth(newMonthKey).entries.push(e);
@@ -1058,7 +1112,7 @@ function saveEntryFromForm() {
   }
   const monthKey = dateVal ? dateVal.slice(0, 7) : currentMonthKey();
   const m = ensureMonth(monthKey);
-  m.entries.push({
+  const newEntry = {
     id: uid(),
     date: dateVal || null,
     categoryId: st.catId,
@@ -1068,7 +1122,10 @@ function saveEntryFromForm() {
     recurring,
     source: "manual",
     createdAt: new Date().toISOString()
-  });
+  };
+  if (st.accountId) newEntry.accountId = st.accountId;
+  m.entries.push(newEntry);
+  adjustAccountBalance(newEntry, 1);
   m.updatedAt = new Date().toISOString();
   saveData();
   st.amountStr = "";
@@ -1234,6 +1291,13 @@ function normalizeData(data) {
   d.months = (d.months || []).map(m => Object.assign(
     { budgets: {}, groups: {}, entries: [], closed: false, incomeComplete: false, imported: false }, m));
   d.months.sort((a, b) => a.month < b.month ? -1 : 1);
+  /* 口座（資産）：無いデータでは空配列にし、壊れた要素は落とす */
+  d.accounts = (Array.isArray(d.accounts) ? d.accounts : [])
+    .filter(a => a && a.id && a.name)
+    .map(a => ({
+      id: String(a.id), name: String(a.name),
+      balance: Number(a.balance) || 0, updatedAt: a.updatedAt || null
+    }));
   /* 集計設定（pendingGroups）がなければ、最新の月のgroupsを現在の設定として引き継ぐ */
   if (!d.settings.pendingGroups) {
     const latest = d.months.length ? d.months[d.months.length - 1] : null;
@@ -1256,6 +1320,121 @@ function importFromFile(file) {
     renderTab();
   };
   reader.readAsText(file);
+}
+
+/* ---------------- 資産タブ（口座・残高の手動管理） ---------------- */
+function renderAssets() {
+  const accs = accounts();
+  const total = accs.reduce((a, x) => a + (Number(x.balance) || 0), 0);
+  $("#tab-assets").innerHTML = `
+    <div class="card">
+      <h3>口座の残高</h3>
+      <div class="row between"><span class="muted">合計</span><span class="big-amount">${esc(yen(total))}</span></div>
+      <p class="muted small" style="margin-top:8px">銀行口座との自動連携はできないため、残高はここで手動管理します。支出・収入の入力で口座を選ぶと、その口座の残高が自動で増減します。実際の残高とズレたときは「残高を更新」で合わせてください。</p>
+    </div>
+    <div class="card">
+      <h3>口座の一覧</h3>
+      ${accs.length ? accs.map(a => `
+        <div class="account-row">
+          <div class="row between">
+            <span class="cat-name">🏦 ${esc(a.name)}</span>
+            <span class="cat-amount">${esc(yen(a.balance))}</span>
+          </div>
+          <div class="row between" style="margin-top:4px">
+            <span class="muted small">${a.updatedAt ? "更新 " + esc(String(a.updatedAt).slice(0, 10).replace(/-/g, "/")) : ""}</span>
+            <span class="row">
+              <button class="btn small" data-acc-balance="${esc(a.id)}">残高を更新</button>
+              <button class="btn small" data-acc-edit="${esc(a.id)}">編集</button>
+            </span>
+          </div>
+        </div>`).join("") : `<p class="empty">口座がまだありません。下から追加できます</p>`}
+    </div>
+    <div class="card">
+      <h3>口座を追加</h3>
+      <div class="field">
+        <label>口座名</label>
+        <input type="text" id="new-acc-name" placeholder="例：ゆうちょ銀行">
+      </div>
+      <div class="field">
+        <label>今の残高（円）</label>
+        <input type="number" id="new-acc-balance" inputmode="numeric" placeholder="0">
+      </div>
+      <button class="btn primary block" id="add-account">口座を追加</button>
+    </div>`;
+
+  $$("#tab-assets [data-acc-balance]").forEach(b => b.addEventListener("click", () => {
+    const acc = accountById(b.dataset.accBalance);
+    if (acc) openAccountBalanceModal(acc);
+  }));
+  $$("#tab-assets [data-acc-edit]").forEach(b => b.addEventListener("click", () => {
+    const acc = accountById(b.dataset.accEdit);
+    if (acc) openAccountEditModal(acc);
+  }));
+  $("#add-account").addEventListener("click", () => {
+    const name = $("#new-acc-name").value.trim();
+    if (!name) { toast("口座名を入力してください"); return; }
+    const bal = Number($("#new-acc-balance").value) || 0;
+    accounts().push({ id: uid(), name, balance: Math.round(bal), updatedAt: new Date().toISOString() });
+    saveData();
+    toast("口座を追加しました");
+    renderAssets();
+  });
+}
+/* 残高を実際の金額に合わせるモーダル */
+function openAccountBalanceModal(acc) {
+  openModal(`<h3>残高を更新</h3>
+    <p class="muted">🏦 ${esc(acc.name)} の実際の残高を入力してください（今の表示は ${esc(yen(acc.balance))}）。</p>
+    <div class="field">
+      <label>残高（円）</label>
+      <input type="number" id="acc-balance-input" inputmode="numeric" value="${Number(acc.balance) || 0}">
+    </div>
+    <div class="row" style="gap:8px">
+      <button class="btn" data-close style="flex:1">やめる</button>
+      <button class="btn primary" id="acc-balance-save" style="flex:2">この残高にする</button>
+    </div>`);
+  bindModalClose();
+  $("#acc-balance-save").addEventListener("click", () => {
+    const v = Number($("#acc-balance-input").value);
+    if (!isFinite(v)) { toast("金額を入力してください"); return; }
+    acc.balance = Math.round(v);
+    acc.updatedAt = new Date().toISOString();
+    saveData();
+    closeModal();
+    toast("残高を更新しました");
+    renderAssets();
+  });
+}
+/* 口座名の編集と削除のモーダル */
+function openAccountEditModal(acc) {
+  openModal(`<h3>口座を編集</h3>
+    <div class="field">
+      <label>口座名</label>
+      <input type="text" id="acc-name-input" value="${esc(acc.name)}">
+    </div>
+    <div class="row" style="gap:8px">
+      <button class="btn" data-close style="flex:1">やめる</button>
+      <button class="btn primary" id="acc-name-save" style="flex:2">保存</button>
+    </div>
+    <button class="btn danger block" id="acc-delete" style="margin-top:16px">この口座を削除</button>
+    <p class="muted small">口座を削除しても過去の記録は消えません（記録に付いていた口座の表示だけ外れます）。</p>`);
+  bindModalClose();
+  $("#acc-name-save").addEventListener("click", () => {
+    const name = $("#acc-name-input").value.trim();
+    if (!name) { toast("口座名を入力してください"); return; }
+    acc.name = name;
+    saveData();
+    closeModal();
+    toast("口座名を変更しました");
+    renderAssets();
+  });
+  $("#acc-delete").addEventListener("click", () => {
+    if (!confirm("口座「" + acc.name + "」を削除しますか？（過去の記録は消えません）")) return;
+    state.data.accounts = accounts().filter(a => a.id !== acc.id);
+    saveData();
+    closeModal();
+    toast("口座を削除しました");
+    renderAssets();
+  });
 }
 
 /* ---------------- 設定タブ ---------------- */

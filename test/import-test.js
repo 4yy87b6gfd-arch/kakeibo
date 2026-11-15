@@ -75,6 +75,22 @@ assert.ok(pgKeys.every(k => pgObj[k] === "expense-14"),
   "pendingGroups の集計先はすべて expense-14（その他）であること");
 console.log("pendingGroups 集計先 = すべて expense-14（その他）");
 
+/* --- 口座（資産）機能の検証 --- */
+const accCount = run("state.data.accounts.length");
+assert.strictEqual(accCount, 0, "移行データに口座は無く、accounts は空配列で初期化されること");
+run('state.data.accounts.push({ id: "acc-test", name: "テスト口座", balance: 10000, updatedAt: null })');
+run('adjustAccountBalance({ accountId: "acc-test", categoryId: "expense-0", amount: 1500 }, 1)');
+assert.strictEqual(run('accountById("acc-test").balance'), 8500, "支出は残高を減らすこと");
+run('adjustAccountBalance({ accountId: "acc-test", categoryId: "income-0", amount: 3000 }, 1)');
+assert.strictEqual(run('accountById("acc-test").balance'), 11500, "収入は残高を増やすこと");
+run('adjustAccountBalance({ accountId: "acc-test", categoryId: "expense-0", amount: 1500 }, -1)');
+assert.strictEqual(run('accountById("acc-test").balance'), 13000, "取り消し（sign=-1）で残高が戻ること");
+run('adjustAccountBalance({ accountId: null, categoryId: "expense-0", amount: 999 }, 1)');
+assert.strictEqual(run('accountById("acc-test").balance'), 13000, "口座未指定の記録は残高に影響しないこと");
+run('adjustAccountBalance({ accountId: "acc-missing", categoryId: "expense-0", amount: 999 }, 1)');
+assert.strictEqual(run('accountById("acc-test").balance'), 13000, "存在しない口座への反映は無視されること");
+console.log("口座残高の連動チェック OK");
+
 /* --- 不正データの検証 --- */
 const bad = run('parseImportJSON("{\\"format\\":\\"other\\"}")');
 assert.strictEqual(bad.ok, false, "形式が違うJSONは拒否されること");

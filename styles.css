@@ -149,6 +149,10 @@ input, select { font: inherit; }
 .entry-amount { font-weight: 700; white-space: nowrap; }
 .entry-del { flex: none; border: none; background: none; color: var(--danger); font-size: 16px; padding: 4px; }
 
+/* 口座行（資産タブ） */
+.account-row { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.account-row:last-child { border-bottom: none; }
+
 /* ドーナツ・グラフ */
 .donut-wrap { display: flex; align-items: center; gap: 16px; }
 .donut-legend { flex: 1; font-size: 13px; }

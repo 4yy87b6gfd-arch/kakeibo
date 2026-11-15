@@ -1,7 +1,7 @@
 /* Budgeting - Service Worker
  * 同一オリジンのGETはネットワーク優先（常に最新を取りに行き、失敗したらキャッシュを返す）。
  * Firebase など外部オリジンには一切触らない。 */
-const CACHE_NAME = "budgeting-v1";
+const CACHE_NAME = "budgeting-v2";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
