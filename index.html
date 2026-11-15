@@ -15,11 +15,12 @@
     <h1 class="gate-title">ふたりの家計簿</h1>
     <!-- 初回：パスワード設定 -->
     <div id="gate-setup" hidden>
-      <p class="gate-text">家族パスワードを設定してください。<br>ふたりで同じパスワードを使います。</p>
-      <input type="password" id="setup-pass1" class="gate-input" placeholder="パスワード" autocomplete="new-password">
+      <p class="gate-text">家族パスワードを設定してください（6文字以上）。<br>ふたりで同じパスワードを使います。</p>
+      <input type="password" id="setup-pass1" class="gate-input" placeholder="パスワード（6文字以上）" autocomplete="new-password">
       <input type="password" id="setup-pass2" class="gate-input" placeholder="パスワード（確認）" autocomplete="new-password">
       <p class="gate-error" id="setup-error"></p>
       <button class="btn primary block" id="setup-btn">設定してはじめる</button>
+      <button class="gate-link" id="to-login-btn">すでに設定済みの方はこちら（ログイン）</button>
     </div>
     <!-- 通常：ログイン -->
     <div id="gate-login" hidden>
@@ -27,6 +28,12 @@
       <input type="password" id="login-pass" class="gate-input" placeholder="パスワード" autocomplete="current-password">
       <p class="gate-error" id="login-error"></p>
       <button class="btn primary block" id="login-btn">開く</button>
+      <button class="gate-link" id="to-setup-btn">はじめての方はこちら（パスワードを新規設定）</button>
+    </div>
+    <!-- オフライン時（同期サービスに接続できない場合の閲覧専用入口） -->
+    <div id="gate-offline" hidden>
+      <p class="gate-text">通信できないため、同期サービスに接続できませんでした。<br>この端末に保存されたデータだけを閲覧できます（編集しても同期されません）。</p>
+      <button class="btn block" id="offline-view-btn">オフラインで閲覧する</button>
     </div>
   </div>
 </div>
@@ -35,8 +42,8 @@
 <div id="app" hidden>
   <header class="app-header">
     <div class="header-title">ふたりの家計簿</div>
-    <!-- 同期状態表示：Firestoreアダプタ導入時にこの要素の文言を差し替える（app.js: renderSyncStatus） -->
-    <div class="sync-status" id="sync-status">ローカル保存</div>
+    <!-- 同期状態表示：app.js の renderSyncStatus() が文言を更新する -->
+    <div class="sync-status" id="sync-status">接続中…</div>
   </header>
 
   <main class="main">

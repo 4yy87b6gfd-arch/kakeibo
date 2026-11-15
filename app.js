@@ -1,25 +1,49 @@
 "use strict";
 /* =====================================================================
- * ふたりの家計簿（移行版・プレビュー）
+ * ふたりの家計簿（移行版）
  * - データ形式は移行元バックアップJSON（format: "futari-kakeibo", version 1）と互換。
- * - データの読み書きはアダプター（storageAdapter）に分離している。
- *   将来 Firebase Firestore に差し替える場合は、FIREBASE_CONFIG を設定し、
- *   storageAdapter の load/save を Firestore 実装に置き換えること。
- * - 同期状態表示の差し替えポイント: renderSyncStatus() と #sync-status 要素。
+ * - 認証は Firebase Authentication（メール/パスワード）。家族パスワードを
+ *   固定の内部メールアドレス（FAMILY_EMAIL）と組み合わせて使う。
+ *   パスワード自体はデータ側に保存しない。
+ * - データ同期は Firestore の単一ドキュメント households/family に全状態を保存。
+ *   localStorage はオフライン用のキャッシュ/ミラーとして併用する。
+ *   保存は saveData() 経由に寄せてある（ミラー即時＋Firestoreへデバウンス送信）。
+ * - 同期状態表示は renderSyncStatus() と #sync-status 要素。
+ * - Firebase SDK は CDN の ES モジュールを動的 import() で読み込む。
+ *   読み込みに失敗しても画面が真っ白にならないよう、失敗時は
+ *   localStorage のキャッシュで閲覧のみ可能なフォールバックに入る。
  * ===================================================================== */
 
-// ▼▼▼ Firebase差し替えポイント ▼▼▼
-// Firestore導入時にプロジェクト設定をここへ入れる（null の間はローカル保存のみ）。
-const FIREBASE_CONFIG = null;
-// ▲▲▲ Firebase差し替えポイント ▲▲▲
+// ▼▼▼ Firebase設定（プロジェクト kakeibo-e246c）▼▼▼
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBLlI5uM2E5nxATXubYmW5lNn6IiwY3n00",
+  authDomain: "kakeibo-e246c.firebaseapp.com",
+  projectId: "kakeibo-e246c",
+  storageBucket: "kakeibo-e246c.firebasestorage.app",
+  messagingSenderId: "560350020102",
+  appId: "1:560350020102:web:e44a066049ab83a0e3b987"
+};
+// ▲▲▲ Firebase設定 ▲▲▲
+
+/* 家族パスワードと組み合わせる固定の内部メールアドレス。
+ * Firestore のセキュリティルールもこのメールアドレスを前提にする。 */
+const FAMILY_EMAIL = "kakeibo.family@kakeibo-e246c.firebaseapp.com";
+/* 全状態を保存する Firestore ドキュメント */
+const HOUSEHOLD_COLLECTION = "households";
+const HOUSEHOLD_DOC_ID = "family";
+/* Firebase JS SDK のバージョン（CDNで実在確認済み：全モジュール HTTP 200） */
+const FB_SDK_VERSION = "11.10.0";
+const FB_SDK_BASE = "https://www.gstatic.com/firebasejs/" + FB_SDK_VERSION + "/";
 
 const LS_DATA_KEY = "futari_kakeibo_data_v1";
-const LS_AUTH_TS_KEY = "futari_kakeibo_auth_ts";
-const AUTH_KEEP_MS = 30 * 24 * 60 * 60 * 1000; // 端末ログイン保持 約30日
+const LS_DEVICE_ID_KEY = "futari_kakeibo_device_id";
+const LS_ACCOUNT_HINT_KEY = "futari_kakeibo_account_hint";
+const CLOUD_SAVE_DEBOUNCE_MS = 800;
 
-/* ---------------- データアダプター ----------------
- * loadData()/saveData() は必ずこのアダプター経由で呼ぶ。
- * Firestore化する場合は storageAdapter の中身だけを差し替える。 */
+/* ---------------- データアダプター（localStorage ミラー） ----------------
+ * storageAdapter は localStorage への読み書き専用（オフライン用キャッシュ/ミラー）。
+ * アプリからの保存は必ず saveData() 経由で行い、ミラー保存に加えて
+ * ログイン中は Firestore へもデバウンス送信する。 */
 const storageAdapter = {
   load() {
     try {
@@ -40,13 +64,222 @@ const storageAdapter = {
   }
 };
 function loadData() { return storageAdapter.load(); }
-function saveData() { if (state.data) storageAdapter.save(state.data); }
+function saveData() {
+  if (!state.data) return;
+  storageAdapter.save(state.data);
+  scheduleCloudSave();
+}
 
-/* 同期状態表示（Firestore導入時はここで「同期済み HH:MM」等に差し替える） */
+/* ---------------- Firebase（認証＋同期）の状態 ----------------
+ * sync.status: boot（起動中） / local（SDK読み込み失敗・閲覧のみ） /
+ *   signedout（未ログイン） / connecting（ログイン直後・初回スナップショット待ち） /
+ *   syncing（同期中） / synced（同期済み） / error（同期エラー） */
+const sync = {
+  fb: null,               // { authApi, fsApi, auth, db, docRef }
+  loadFailed: false,
+  user: null,
+  status: "boot",
+  lastSyncedAt: null,     // 最後に同期が確認できた時刻（ms）
+  lastRemoteUpdatedAt: 0, // 最後に受理したリモートの updatedAt
+  firstSnapshotDone: false,
+  unsubscribe: null,
+  saveTimer: null,
+  pendingRemote: null     // 入力フォーム編集中に届いたリモート状態（適用を保留）
+};
+let offlineViewing = false; // SDK読み込み失敗時にキャッシュ閲覧へ入ったかどうか
+
+/* 端末ごとのランダムID。Firestoreドキュメントの writer に載せ、自己エコーの判別に使う。 */
+function deviceId() {
+  let id = null;
+  try { id = localStorage.getItem(LS_DEVICE_ID_KEY); } catch (e) { /* ignore */ }
+  if (!id) {
+    id = uid();
+    try { localStorage.setItem(LS_DEVICE_ID_KEY, id); } catch (e) { /* ignore */ }
+  }
+  return id;
+}
+
+/* 同期状態表示（#sync-status） */
 function renderSyncStatus() {
   const el = document.getElementById("sync-status");
   if (!el) return;
-  el.textContent = FIREBASE_CONFIG ? "同期済み" : "ローカル保存";
+  switch (sync.status) {
+    case "local": el.textContent = "オフライン（閲覧のみ）"; break;
+    case "signedout": el.textContent = "未ログイン"; break;
+    case "connecting": el.textContent = "同期中…"; break;
+    case "syncing": el.textContent = "同期中…"; break;
+    case "error": el.textContent = "同期エラー"; break;
+    case "synced": {
+      if (sync.lastSyncedAt) {
+        const d = new Date(sync.lastSyncedAt);
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        el.textContent = "同期済み " + hh + ":" + mm;
+      } else {
+        el.textContent = "同期済み";
+      }
+      break;
+    }
+    default: el.textContent = "接続中…";
+  }
+}
+
+/* Firebase SDK を CDN の ES モジュールとして動的に読み込む。
+ * 失敗した場合は例外を投げ、呼び出し側（init）でフォールバックする。 */
+async function loadFirebaseSDK() {
+  const [appM, authM, fsM] = await Promise.all([
+    import(FB_SDK_BASE + "firebase-app.js"),
+    import(FB_SDK_BASE + "firebase-auth.js"),
+    import(FB_SDK_BASE + "firebase-firestore.js")
+  ]);
+  const app = appM.initializeApp(FIREBASE_CONFIG);
+  const auth = authM.getAuth(app); // 永続化はデフォルト（ローカル）を使用
+  const db = fsM.getFirestore(app);
+  return {
+    authApi: authM,
+    fsApi: fsM,
+    auth,
+    db,
+    docRef: fsM.doc(db, HOUSEHOLD_COLLECTION, HOUSEHOLD_DOC_ID)
+  };
+}
+
+/* Firebase Auth のエラーを日本語メッセージに変換する（純粋関数・テスト対象） */
+function authErrorMessage(e) {
+  const code = e && e.code ? String(e.code) : "";
+  switch (code) {
+    case "auth/invalid-credential":
+    case "auth/wrong-password":
+    case "auth/user-not-found":
+    case "auth/invalid-login-credentials":
+      return "パスワードが違います。";
+    case "auth/email-already-in-use":
+      return "このパスワードは既に別の端末で設定済みの可能性があります。ログインを試してください。";
+    case "auth/weak-password":
+      return "パスワードは6文字以上にしてください。";
+    case "auth/network-request-failed":
+      return "通信エラーが発生しました。接続を確認してもう一度お試しください。";
+    case "auth/too-many-requests":
+      return "試行回数が多すぎます。しばらく待ってからもう一度お試しください。";
+    case "auth/requires-recent-login":
+      return "安全のため再ログインが必要です。一度ログアウトしてログインし直してから操作してください。";
+    case "auth/operation-not-allowed":
+      return "ログイン方式が有効になっていません（Firebaseコンソールでメール/パスワード認証を有効化してください）。";
+    default:
+      return "エラーが発生しました" + (code ? "（" + code + "）" : "") + "。";
+  }
+}
+
+/* リモートスナップショットへの対応を決める（純粋関数・テスト対象）
+ * 戻り値: "ignore"（データなし） / "self"（自分の書き込みのエコー） /
+ *         "stale"（受理済みより古い） / "apply"（状態を差し替える） */
+function remoteApplyDecision(remote, myDeviceId, lastSeenUpdatedAt) {
+  if (!remote || typeof remote !== "object" || !remote.state) return "ignore";
+  if (remote.writer && remote.writer === myDeviceId) return "self";
+  if ((Number(remote.updatedAt) || 0) <= (Number(lastSeenUpdatedAt) || 0)) return "stale";
+  return "apply";
+}
+
+/* ローカルの変更を Firestore へ送る（デバウンス付き）。
+ * 未ログイン・初回スナップショット前・SDK未接続のときは何もしない
+ * （localStorage ミラーには保存済みなので、データ自体は端末に残る）。 */
+function scheduleCloudSave() {
+  if (!sync.fb || !sync.user || !sync.firstSnapshotDone || !state.data) return;
+  sync.status = "syncing";
+  renderSyncStatus();
+  clearTimeout(sync.saveTimer);
+  sync.saveTimer = setTimeout(pushToCloud, CLOUD_SAVE_DEBOUNCE_MS);
+}
+async function pushToCloud() {
+  if (!sync.fb || !sync.user || !state.data) return;
+  const payload = {
+    state: JSON.parse(JSON.stringify(state.data)),
+    updatedAt: Date.now(),
+    writer: deviceId()
+  };
+  delete payload.state.auth; // 念のため（パスワード類はクラウドに載せない）
+  try {
+    await sync.fb.fsApi.setDoc(sync.fb.docRef, payload);
+    sync.lastRemoteUpdatedAt = payload.updatedAt;
+    sync.lastSyncedAt = payload.updatedAt;
+    sync.status = "synced";
+  } catch (e) {
+    console.error("cloud save failed", e);
+    sync.status = "error";
+  }
+  renderSyncStatus();
+}
+
+/* Firestore の購読開始（ログイン後に呼ぶ） */
+function subscribeHousehold() {
+  if (!sync.fb || sync.unsubscribe) return;
+  sync.unsubscribe = sync.fb.fsApi.onSnapshot(sync.fb.docRef, (snap) => {
+    sync.firstSnapshotDone = true;
+    if (!snap.exists()) {
+      /* ドキュメントがまだ無い初回。空の初期状態を勝手にアップロードして
+       * 既存データを上書きしない。ドキュメントは、ログイン後にユーザーが
+       * JSONをインポート（または編集を保存）した時点で saveData 経由で作られる。 */
+      sync.status = "synced";
+      renderSyncStatus();
+      return;
+    }
+    const remote = snap.data();
+    const decision = remoteApplyDecision(remote, deviceId(), sync.lastRemoteUpdatedAt);
+    if (decision === "self") {
+      sync.lastRemoteUpdatedAt = Number(remote.updatedAt) || sync.lastRemoteUpdatedAt;
+      sync.lastSyncedAt = Number(remote.updatedAt) || sync.lastSyncedAt;
+    } else if (decision === "apply") {
+      sync.lastRemoteUpdatedAt = Number(remote.updatedAt) || 0;
+      sync.lastSyncedAt = Number(remote.updatedAt) || Date.now();
+      applyRemoteState(remote.state);
+    }
+    sync.status = "synced";
+    renderSyncStatus();
+  }, (e) => {
+    console.error("snapshot error", e);
+    sync.firstSnapshotDone = true;
+    sync.status = "error";
+    renderSyncStatus();
+  });
+}
+function unsubscribeHousehold() {
+  if (sync.unsubscribe) {
+    try { sync.unsubscribe(); } catch (e) { /* ignore */ }
+    sync.unsubscribe = null;
+  }
+  sync.firstSnapshotDone = false;
+  sync.pendingRemote = null;
+  clearTimeout(sync.saveTimer);
+}
+
+/* リモート状態の適用。入力フォームの編集中は適用を保留し、入力を壊さない。 */
+function isEntryDirty() {
+  if (state.tab !== "entry") return false;
+  if (state.entry.editingId || state.entry.amountStr) return true;
+  const note = document.getElementById("entry-note");
+  return !!(note && note.value);
+}
+function applyRemoteState(remoteState) {
+  if (isEntryDirty()) {
+    sync.pendingRemote = remoteState;
+    toast("別の端末で更新されました（入力が終わったら反映します）");
+    return;
+  }
+  doApplyRemoteState(remoteState);
+}
+function doApplyRemoteState(remoteState) {
+  const clean = normalizeData(JSON.parse(JSON.stringify(remoteState)));
+  delete clean.auth;
+  state.data = clean;
+  storageAdapter.save(state.data); // ミラーのみ更新する（クラウドへは送り返さない）
+  renderTab();
+}
+function maybeApplyPendingRemote() {
+  if (sync.pendingRemote && !isEntryDirty()) {
+    const r = sync.pendingRemote;
+    sync.pendingRemote = null;
+    doApplyRemoteState(r);
+  }
 }
 
 /* ---------------- ユーティリティ ---------------- */
@@ -79,22 +312,6 @@ function todayStr() {
   const d = new Date();
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 }
-/* SHA-256（secure context用）。使えない環境向けに簡易ハッシュへフォールバック */
-async function sha256(text) {
-  if (window.crypto && crypto.subtle) {
-    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
-  }
-  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return "fallback-" + (h2 >>> 0).toString(16) + (h1 >>> 0).toString(16);
-}
 function toast(msg) {
   const t = $("#toast");
   t.textContent = msg;
@@ -112,8 +329,9 @@ function toast(msg) {
  *               pendingGroups: { 子カテゴリID: 親カテゴリID }  // 新規月にのみ反映する集計設定
  *             },
  *   months: [ { month: "YYYY-MM", budgets: {catId: 金額}, groups: {子ID: 親ID},
- *               entries: [...], closed, incomeComplete, imported, ... } ],
- *   auth: { passwordHash }  // ローカル専用（エクスポート時は除外する）
+ *               entries: [...], closed, incomeComplete, imported, ... } ]
+ *   ※ パスワードは Firebase Auth で管理し、データ内には持たない。
+ *     旧データや移行用JSONに auth が含まれていても normalizeData で除去する。
  * } */
 function emptyData() {
   return {
@@ -134,8 +352,7 @@ function emptyData() {
       keywords: {},
       pendingGroups: {}
     },
-    months: [],
-    auth: null
+    months: []
   };
 }
 
@@ -252,22 +469,26 @@ function rolledUpRows(monthObj, kind) {
     .sort((a, b) => b.amount - a.amount);
 }
 
-/* ---------------- 認証（家族パスワード） ---------------- */
-function isAuthFresh() {
-  const ts = Number(localStorage.getItem(LS_AUTH_TS_KEY) || 0);
-  return ts > 0 && (Date.now() - ts) < AUTH_KEEP_MS;
-}
-function markAuthed() { localStorage.setItem(LS_AUTH_TS_KEY, String(Date.now())); }
-function logout() {
-  localStorage.removeItem(LS_AUTH_TS_KEY);
+/* ---------------- 認証（家族パスワード = Firebase Auth） ----------------
+ * 家族パスワードは、固定の内部メール FAMILY_EMAIL と組み合わせて
+ * Firebase Authentication のメール/パスワード認証で照合する。
+ * ログイン状態の保持は Firebase Auth のローカル永続化（デフォルト）に任せる。 */
+async function logout() {
+  if (sync.fb) {
+    try { await sync.fb.authApi.signOut(sync.fb.auth); }
+    catch (e) { console.error("signOut failed", e); }
+  }
   location.reload();
 }
-function showGate() {
+/* ゲート表示。mode: "setup" | "login"（省略時はこの端末の履歴から推定する） */
+function showGate(mode) {
   $("#gate").hidden = false;
   $("#app").hidden = true;
-  const hasPass = !!(state.data && state.data.auth && state.data.auth.passwordHash);
-  $("#gate-setup").hidden = hasPass;
-  $("#gate-login").hidden = !hasPass;
+  const m = mode || (localStorage.getItem(LS_ACCOUNT_HINT_KEY) ? "login" : "setup");
+  $("#gate-setup").hidden = m !== "setup";
+  $("#gate-login").hidden = m !== "login";
+  const off = $("#gate-offline");
+  if (off) off.hidden = !sync.loadFailed;
 }
 function showApp() {
   $("#gate").hidden = true;
@@ -275,32 +496,74 @@ function showApp() {
   renderSyncStatus();
   renderTab();
 }
+/* Firebase Auth の状態変化（ログイン/ログアウト）を受ける */
+function handleAuthState(user) {
+  sync.user = user || null;
+  if (sync.user) {
+    offlineViewing = false;
+    sync.status = "connecting";
+    renderSyncStatus();
+    showApp();
+    subscribeHousehold();
+  } else {
+    unsubscribeHousehold();
+    sync.status = sync.loadFailed ? "local" : "signedout";
+    renderSyncStatus();
+    if (!offlineViewing) showGate();
+  }
+}
 async function setupPassword() {
   const p1 = $("#setup-pass1").value, p2 = $("#setup-pass2").value;
   const err = $("#setup-error");
-  if (!p1 || p1.length < 4) { err.textContent = "4文字以上のパスワードにしてください。"; return; }
+  const btn = $("#setup-btn");
+  if (!sync.fb) { err.textContent = "オフラインのため設定できません。接続を確認してもう一度お試しください。"; return; }
+  if (!p1 || p1.length < 6) { err.textContent = "パスワードは6文字以上にしてください。"; return; }
   if (p1 !== p2) { err.textContent = "確認用パスワードが一致しません。"; return; }
-  state.data.auth = { passwordHash: await sha256(p1) };
-  saveData();
-  markAuthed();
-  toast("パスワードを設定しました");
-  showApp();
+  btn.disabled = true;
+  try {
+    await sync.fb.authApi.createUserWithEmailAndPassword(sync.fb.auth, FAMILY_EMAIL, p1);
+    localStorage.setItem(LS_ACCOUNT_HINT_KEY, "1");
+    toast("パスワードを設定しました");
+    /* 以後の画面遷移は handleAuthState が行う */
+  } catch (e) {
+    console.error("createUser failed", e);
+    if (e && e.code === "auth/email-already-in-use") {
+      localStorage.setItem(LS_ACCOUNT_HINT_KEY, "1");
+      err.textContent = authErrorMessage(e);
+      showGate("login");
+      $("#login-error").textContent = "この家族パスワードは既に設定済みです。設定したパスワードでログインしてください。";
+      const lp = $("#login-pass"); if (lp) lp.value = "";
+    } else {
+      err.textContent = authErrorMessage(e);
+    }
+  } finally {
+    btn.disabled = false;
+  }
 }
 async function tryLogin() {
   const p = $("#login-pass").value;
   const err = $("#login-error");
-  const hash = await sha256(p);
-  if (state.data.auth && hash === state.data.auth.passwordHash) {
-    markAuthed();
-    showApp();
-  } else {
-    err.textContent = "パスワードが違います。";
+  const btn = $("#login-btn");
+  if (!sync.fb) { err.textContent = "オフラインのためログインできません。接続を確認するか、下の「オフラインで閲覧する」をお使いください。"; return; }
+  if (!p) { err.textContent = "パスワードを入力してください。"; return; }
+  if (p.length < 6) { err.textContent = "パスワードは6文字以上です。入力内容を確認してください。"; return; }
+  btn.disabled = true;
+  try {
+    await sync.fb.authApi.signInWithEmailAndPassword(sync.fb.auth, FAMILY_EMAIL, p);
+    localStorage.setItem(LS_ACCOUNT_HINT_KEY, "1");
+    /* 以後の画面遷移は handleAuthState が行う */
+  } catch (e) {
+    console.error("signIn failed", e);
+    err.textContent = authErrorMessage(e);
+  } finally {
+    btn.disabled = false;
   }
 }
 
 /* ---------------- タブ切替 ---------------- */
 function switchTab(tab) {
   state.tab = tab;
+  if (tab !== "entry") maybeApplyPendingRemote();
   $$(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   ["home", "history", "entry", "compare", "settings"].forEach(t => {
     $("#tab-" + t).hidden = t !== tab;
@@ -793,6 +1056,7 @@ function saveEntryFromForm() {
     toast("更新しました");
     renderEntry();
     const n = $("#entry-note"); if (n) n.value = "";
+    maybeApplyPendingRemote();
     return;
   }
   const monthKey = dateVal ? dateVal.slice(0, 7) : currentMonthKey();
@@ -814,6 +1078,7 @@ function saveEntryFromForm() {
   const n2 = $("#entry-note"); if (n2) n2.value = "";
   const r2 = $("#entry-recurring"); if (r2) r2.checked = false;
   renderEntryForm();
+  maybeApplyPendingRemote();
   toast(monthLabel(monthKey) + "に保存しました");
 }
 
@@ -964,6 +1229,7 @@ function parseImportJSON(text) {
 }
 function normalizeData(data) {
   const d = data;
+  delete d.auth; // パスワードハッシュは Auth 管理に移行したため、データ側では保持しない
   d.settings = d.settings || {};
   d.settings.members = Array.isArray(d.settings.members) && d.settings.members.length ? d.settings.members : ["健人", "知尋"];
   d.settings.categories = d.settings.categories || [];
@@ -983,11 +1249,9 @@ function importFromFile(file) {
   reader.onload = () => {
     const res = parseImportJSON(String(reader.result || ""));
     if (!res.ok) { alert("読み込めませんでした：" + res.error); return; }
-    const msg = `バックアップを取り込みますか？\n（${res.stats.months}か月・記録${res.stats.entries}件・カテゴリー${res.stats.categories}件）\n今のローカルデータは置き換えられます。`;
+    const msg = `バックアップを取り込みますか？\n（${res.stats.months}か月・記録${res.stats.entries}件・カテゴリー${res.stats.categories}件）\n今のデータは置き換えられます（ログイン中は同期先にも反映されます）。`;
     if (!confirm(msg)) return;
-    const keepAuth = state.data ? state.data.auth : null;
-    state.data = res.data;
-    state.data.auth = keepAuth; // パスワードは端末側の設定を保持する
+    state.data = res.data; // 取り込みJSONにパスワード情報が含まれていても無視する（Authで管理）
     saveData();
     toast("バックアップを取り込みました");
     state.home.month = currentMonthKey();
@@ -1073,13 +1337,14 @@ function renderSettings() {
 
     <div class="card">
       <h3>パスワード</h3>
+      <p class="muted small">家族パスワードはFirebaseで管理しています（6文字以上）。変更すると、ふたりの端末に効きます。</p>
       <div class="field"><input type="password" id="pass-new1" placeholder="新しいパスワード" autocomplete="new-password"></div>
       <div class="field"><input type="password" id="pass-new2" placeholder="新しいパスワード（確認）" autocomplete="new-password"></div>
       <button class="btn block" id="change-pass">パスワードを変更</button>
     </div>
 
     <button class="btn danger block" id="logout-btn">この端末からログアウト</button>
-    <p class="muted small" style="text-align:center; margin-top:14px">ふたりの家計簿（移行版プレビュー）／ データはこの端末のブラウザに保存されています</p>`;
+    <p class="muted small" style="text-align:center; margin-top:14px">ふたりの家計簿（移行版）／ データはFirestoreに同期され、この端末にも控えが保存されます</p>`;
 
   $$("#tab-settings [data-act]").forEach(btn => btn.addEventListener("click", () => {
     if (btn.dataset.act === "set-prev") { state.settings.month = addMonths(key, -1); renderSettings(); }
@@ -1165,12 +1430,17 @@ function renderSettings() {
   $("#import-json").addEventListener("click", () => $("#import-file").click());
   $("#change-pass").addEventListener("click", async () => {
     const p1 = $("#pass-new1").value, p2 = $("#pass-new2").value;
-    if (!p1 || p1.length < 4) { toast("4文字以上のパスワードにしてください"); return; }
+    if (!p1 || p1.length < 6) { toast("パスワードは6文字以上にしてください"); return; }
     if (p1 !== p2) { toast("確認用パスワードが一致しません"); return; }
-    state.data.auth = { passwordHash: await sha256(p1) };
-    saveData();
-    toast("パスワードを変更しました");
-    renderSettings();
+    if (!sync.fb || !sync.user) { toast("ログイン中のみパスワードを変更できます"); return; }
+    try {
+      await sync.fb.authApi.updatePassword(sync.user, p1);
+      toast("パスワードを変更しました");
+      renderSettings();
+    } catch (e) {
+      console.error("updatePassword failed", e);
+      toast(authErrorMessage(e));
+    }
   });
   $("#logout-btn").addEventListener("click", () => {
     if (confirm("この端末からログアウトしますか？（データは消えません）")) logout();
@@ -1178,25 +1448,45 @@ function renderSettings() {
 }
 
 /* ---------------- 初期化 ---------------- */
-function init() {
+async function init() {
   state.data = loadData();
   if (!state.data) {
     state.data = emptyData();
-    saveData();
+    storageAdapter.save(state.data);
   } else {
     state.data = normalizeData(state.data);
+    storageAdapter.save(state.data); // auth除去など正規化の結果をミラーへ反映する
   }
   $$(".tab-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
   $("#modal-backdrop").addEventListener("click", (ev) => { if (ev.target.id === "modal-backdrop") closeModal(); });
   $("#setup-btn").addEventListener("click", setupPassword);
   $("#login-btn").addEventListener("click", tryLogin);
   $("#login-pass").addEventListener("keydown", (ev) => { if (ev.key === "Enter") tryLogin(); });
+  $("#to-login-btn").addEventListener("click", () => showGate("login"));
+  $("#to-setup-btn").addEventListener("click", () => showGate("setup"));
+  $("#offline-view-btn").addEventListener("click", () => {
+    offlineViewing = true;
+    sync.status = "local";
+    showApp();
+    toast("オフライン閲覧中（編集しても同期されません）");
+  });
   $("#import-file").addEventListener("change", (ev) => {
     if (ev.target.files && ev.target.files[0]) importFromFile(ev.target.files[0]);
     ev.target.value = "";
   });
-  const hasPass = !!(state.data.auth && state.data.auth.passwordHash);
-  if (hasPass && isAuthFresh()) showApp();
-  else showGate();
+  /* まずゲートを表示しておき（真っ白防止）、Firebase の起動を試みる。
+   * ログイン済みなら handleAuthState がアプリ画面へ切り替える。 */
+  showGate();
+  renderSyncStatus();
+  try {
+    sync.fb = await loadFirebaseSDK();
+    sync.fb.authApi.onAuthStateChanged(sync.fb.auth, handleAuthState);
+  } catch (e) {
+    console.error("Firebase SDK load failed", e);
+    sync.loadFailed = true;
+    sync.status = "local";
+    renderSyncStatus();
+    showGate(); // オフライン閲覧の入口を表示する
+  }
 }
 document.addEventListener("DOMContentLoaded", init);
